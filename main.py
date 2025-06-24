@@ -147,7 +147,7 @@ def leaderboard_with_badges(compliance_summary):
 
 # --------- STREAMLIT UI ---------
 
-st.title("JotForm Compliance & Gamification Dashboard")
+st.title("JotForm Compliance Dashboard")
 
 # Load API key from secrets (set after deploying to Streamlit Cloud)
 api_key = st.secrets["API_KEY"] if "API_KEY" in st.secrets else st.text_input("Enter your JotForm API Key:", type="password")
