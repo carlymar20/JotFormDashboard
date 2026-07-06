@@ -2,6 +2,7 @@ import streamlit as st
 import pandas as pd
 import requests
 import io
+import time
 
 # -------- SETTINGS --------
 FORM_COMPLIANCE = {
@@ -35,6 +36,7 @@ def get_submissions(form_id, api_key, start_date=None, end_date=None):
     all_submissions = []
     batch_size = 1000
     offset = 0
+    max_retries = 3
     while True:
         url = f"https://api.jotform.com/form/{form_id}/submissions"
         params = {
@@ -49,8 +51,30 @@ def get_submissions(form_id, api_key, start_date=None, end_date=None):
             if end_date:
                 filters["created_at:lt"] = f"{end_date}T23:59:59"
             params["filter"] = str(filters).replace("'", '"')
-        r = requests.get(url, params=params)
-        r.raise_for_status()
+
+        r = None
+        for attempt in range(1, max_retries + 1):
+            r = requests.get(url, params=params, timeout=60)
+            if r.ok:
+                break
+            # 502/503/504 are usually transient server-side hiccups on
+            # JotForm's end (server overloaded or slow) — worth a retry
+            # with a short pause. Other errors (401, 403, 400) won't be
+            # fixed by retrying, so fail immediately on those.
+            if r.status_code in (502, 503, 504) and attempt < max_retries:
+                time.sleep(attempt * 2)  # 2s, then 4s
+                continue
+            break
+
+        if not r.ok:
+            form_label = FORM_ID_TO_NAME.get(form_id, form_id)
+            st.error(
+                f"JotForm API error while fetching '{form_label}' "
+                f"(status {r.status_code}) after {max_retries} attempt(s): "
+                f"{r.text[:500]}"
+            )
+            st.stop()
+
         submissions = r.json()['content']
         all_submissions.extend(submissions)
         if len(submissions) < batch_size:
