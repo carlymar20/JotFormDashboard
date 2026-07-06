@@ -1,6 +1,7 @@
 import streamlit as st
 import pandas as pd
 import requests
+import io
 
 # -------- SETTINGS --------
 FORM_COMPLIANCE = {
@@ -24,7 +25,11 @@ FORM_ID_TO_NAME = {
     "222195371011142": "Site Audit"
 }
 FORM_NAME_TO_ID = {v: k for k, v in FORM_ID_TO_NAME.items()}
-LOCATION_FIELD = "location"
+
+# We match on this word appearing in the field's internal name OR its label,
+# since JotForm auto-generates internal names per-form and they don't always match.
+LOCATION_MATCH_WORD = "location"
+
 
 def get_submissions(form_id, api_key, start_date=None, end_date=None):
     all_submissions = []
@@ -53,7 +58,15 @@ def get_submissions(form_id, api_key, start_date=None, end_date=None):
         offset += batch_size
     return all_submissions
 
-def extract_row(sub, form_id, location_field):
+
+def extract_row(sub, form_id):
+    """Pull out the fields we care about from one submission.
+
+    Matches the location field by checking whether "location" appears in
+    either the field's internal name or its human-readable label, since
+    JotForm generates internal names independently per form and they can
+    differ even when the visible question is identical.
+    """
     answers = sub['answers']
     row = {
         'form_id': form_id,
@@ -63,9 +76,13 @@ def extract_row(sub, form_id, location_field):
         'location': None
     }
     for k, v in answers.items():
-        if v['name'] == location_field:
-            row['location'] = v.get('answer', '')
+        name = str(v.get('name', '')).strip().lower()
+        label = str(v.get('text', '')).strip().lower()
+        if LOCATION_MATCH_WORD in name or LOCATION_MATCH_WORD in label:
+            ans = v.get('answer', '')
+            row['location'] = ans if isinstance(ans, str) else str(ans)
     return row
+
 
 def get_all_data(form_names, location_list, start_date, end_date, api_key):
     all_rows = []
@@ -73,11 +90,12 @@ def get_all_data(form_names, location_list, start_date, end_date, api_key):
     for form_id in form_ids:
         submissions = get_submissions(form_id, api_key, start_date, end_date)
         for sub in submissions:
-            row = extract_row(sub, form_id, LOCATION_FIELD)
+            row = extract_row(sub, form_id)
             if not location_list or row['location'] in location_list:
                 all_rows.append(row)
     df_raw = pd.DataFrame(all_rows)
     return df_raw
+
 
 def compute_period_targets(df_raw, start_date, end_date, selected_forms, selected_locations):
     summary_rows = []
@@ -105,7 +123,7 @@ def compute_period_targets(df_raw, start_date, end_date, selected_forms, selecte
             actual = len(df_form_loc)
             target = period_count * quota
             percent_complete = 100 * actual / target if target else 0
-            status = "Met" if actual >= target else f"Missing {target-actual}"
+            status = "Met" if actual >= target else f"Missing {target - actual}"
             summary_rows.append({
                 "form_name": form_name,
                 "location": loc,
@@ -114,24 +132,26 @@ def compute_period_targets(df_raw, start_date, end_date, selected_forms, selecte
                 "quota_per_period": quota,
                 "target_total": target,
                 "actual_total": actual,
-                "percent_complete": round(percent_complete,1),
+                "percent_complete": round(percent_complete, 1),
                 "status": status
             })
     summary_df = pd.DataFrame(summary_rows)
     return summary_df
 
+
 def leaderboard_with_badges(compliance_summary):
     if compliance_summary.empty:
-        return pd.DataFrame(columns=['location','overall_percent','Badge','Rank'])
+        return pd.DataFrame(columns=['location', 'overall_percent', 'Badge', 'Rank'])
     leader = (compliance_summary.groupby('location')
               .agg(
-                  forms_tracked=('form_name','count'),
-                  total_target=('target_total','sum'),
-                  total_actual=('actual_total','sum'),
-                  overall_percent=('percent_complete','mean')
+                  forms_tracked=('form_name', 'count'),
+                  total_target=('target_total', 'sum'),
+                  total_actual=('actual_total', 'sum'),
+                  overall_percent=('percent_complete', 'mean')
               ).reset_index()
               )
     leader = leader.sort_values('overall_percent', ascending=False)
+
     def badge_row(row):
         if row['overall_percent'] >= 100:
             return "🏅 Gold Star"
@@ -141,9 +161,11 @@ def leaderboard_with_badges(compliance_summary):
             return "🥉 Bronze Star"
         else:
             return "🚩 Needs Improvement"
+
     leader['Badge'] = leader.apply(badge_row, axis=1)
     leader['Rank'] = leader['overall_percent'].rank(method='min', ascending=False).astype(int)
     return leader
+
 
 # --------- STREAMLIT UI ---------
 
@@ -160,7 +182,9 @@ selected_forms = st.multiselect("Select form(s):", options=form_names, default=f
 start_date = st.date_input("Start date")
 end_date = st.date_input("End date")
 
-# For the location picker, fetch after forms/dates picked
+# ---- Debug button: shows each form's actual field names/labels ----
+# Use this if submissions are visible in JotForm but missing from the report.
+# It tells you whether the "location" field is named consistently across forms.
 if st.button("Debug Field Names"):
     if not api_key:
         st.error("API Key is required!")
@@ -171,7 +195,10 @@ if st.button("Debug Field Names"):
             if subs:
                 st.write({v['name']: v.get('text') for v in subs[0]['answers'].values()})
             else:
-                st.write("⚠️ No submissions returned at all for this form/date range")if st.button("Load Locations"):
+                st.write("⚠️ No submissions returned at all for this form/date range")
+
+# For the location picker, fetch after forms/dates picked
+if st.button("Load Locations"):
     if not api_key:
         st.error("API Key is required!")
     else:
@@ -182,9 +209,17 @@ if st.button("Debug Field Names"):
         else:
             locations = sorted([loc for loc in df_raw_temp['location'].dropna().unique() if str(loc).strip() != ""])
         st.session_state['locations'] = locations
+        # Reset the selection to match the freshly loaded options, so we never
+        # end up with a stale default that no longer matches the option list.
+        st.session_state['selected_locations'] = locations
 
 locations = st.session_state.get('locations', [])
-selected_locations = st.multiselect("Select location(s):", options=locations, default=locations)
+selected_locations = st.multiselect(
+    "Select location(s):",
+    options=locations,
+    default=st.session_state.get('selected_locations', locations),
+    key='selected_locations_widget'
+)
 
 if st.button("Run Report"):
     if not api_key:
@@ -209,7 +244,6 @@ if st.button("Run Report"):
             submission_count = df_raw.groupby(['form_name', 'location']).size().reset_index(name='submission_count')
 
             # Excel export
-            import io
             output = io.BytesIO()
             with pd.ExcelWriter(output, engine='openpyxl') as writer:
                 compliance_summary.to_excel(writer, index=False, sheet_name='Compliance Summary')
