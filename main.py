@@ -161,7 +161,17 @@ start_date = st.date_input("Start date")
 end_date = st.date_input("End date")
 
 # For the location picker, fetch after forms/dates picked
-if st.button("Load Locations"):
+if st.button("Debug Field Names"):
+    if not api_key:
+        st.error("API Key is required!")
+    else:
+        for form_id in [FORM_NAME_TO_ID[n] for n in selected_forms]:
+            subs = get_submissions(form_id, api_key, start_date, end_date)
+            st.write(f"### {FORM_ID_TO_NAME[form_id]}")
+            if subs:
+                st.write({v['name']: v.get('text') for v in subs[0]['answers'].values()})
+            else:
+                st.write("⚠️ No submissions returned at all for this form/date range")if st.button("Load Locations"):
     if not api_key:
         st.error("API Key is required!")
     else:
