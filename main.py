@@ -27,8 +27,25 @@ FORM_ID_TO_NAME = {
 }
 FORM_NAME_TO_ID = {v: k for k, v in FORM_ID_TO_NAME.items()}
 
-# We match on this word appearing in the field's internal name OR its label,
-# since JotForm auto-generates internal names per-form and they don't always match.
+# Confirmed exact internal field names for the location field(s) on each
+# form. Several forms have the location duplicated across two fields
+# (e.g. a "pick from list" path vs. a "manual entry" path in the form's
+# conditional logic) — only one of the two is actually filled in on any
+# given submission, so we check both and use whichever is non-empty.
+FORM_ID_TO_LOCATION_FIELDS = {
+    "250265807744158": ["location125", "location"],   # AWEstruck Arival/Departure
+    "242047162465151": ["location", "location60"],    # Daily Huddle
+    "230053977061151": ["location172", "location"],   # Valet Driver Assessment
+    "242746988998184": ["location73", "location1"],   # Key Scrub
+    "223424048202040": ["location"],                  # Lot Audit
+    "230404704539149": ["location", "location39"],    # Overnight Valet
+    "233176683727163": ["location"],                  # Parking/Work Area Hazard
+    "222195371011142": ["location74", "location"],    # Site Audit
+}
+
+# Kept for the diagnostic "Debug Location Field Setup" button below, which
+# scans for anything mentioning "location" for troubleshooting purposes.
+# It is no longer used to decide which field's answer to actually pull.
 LOCATION_MATCH_WORD = "location"
 
 
@@ -65,53 +82,28 @@ def get_form_questions(form_id, api_key):
     return r.json()['content']
 
 
-def find_location_field(items):
-    """Given (key, field) pairs sorted in form order, return the field
-    that is the REAL location dropdown.
+def get_location_options_for_form(form_id, api_key):
+    """Return the list of valid location names as defined on this form's
+    real location dropdown field(s) — using the confirmed field name(s)
+    from FORM_ID_TO_LOCATION_FIELDS, not from submitted answers.
 
-    Many of these forms have two fields that both mention "location":
-    one is often a plain free-text field (accepts anything someone
-    types), the other is the actual dropdown/select widget used to
-    route the notification email to the right site. Since email
-    routing logic can't work off of freeform text, the field that has
-    actual dropdown options defined in its setup is the reliable
-    signal for "this is the real one" — not its name or position on
-    the form.
+    Where a form has two location fields, options are collected from
+    whichever of them actually has a dropdown list defined.
     """
-    candidates = [q for (k, q) in items
-                  if LOCATION_MATCH_WORD in str(q.get('name', '')).strip().lower()
-                  or LOCATION_MATCH_WORD in str(q.get('text', '')).strip().lower()]
-    if not candidates:
-        return None
+    field_names = FORM_ID_TO_LOCATION_FIELDS.get(form_id, [])
+    if not field_names:
+        return []
 
-    # Prefer whichever candidate actually has dropdown options defined.
-    for q in candidates:
-        if (q.get('options') or '').strip():
-            return q
-
-    # None have options (unusual) — fall back to the last matching field,
-    # since on these forms the true selector tends to sit near the bottom,
-    # next to the email-routing logic.
-    return candidates[-1]
-
-
-def get_location_field_name_and_options(form_id, api_key):
-    """Return (internal_field_name, [list of valid dropdown options])
-    for the real location field on this form.
-    """
     questions = get_form_questions(form_id, api_key)
-    try:
-        items = sorted(questions.items(), key=lambda kv: int(kv[0]))
-    except (ValueError, TypeError):
-        items = list(questions.items())
-
-    field = find_location_field(items)
-    if not field:
-        return None, []
-
-    options_str = field.get('options', '') or ''
-    options = [o.strip() for o in options_str.split('|') if o.strip()]
-    return field.get('name'), options
+    options = set()
+    for k, q in questions.items():
+        if q.get('name') in field_names:
+            options_str = q.get('options', '') or ''
+            for o in options_str.split('|'):
+                o = o.strip()
+                if o:
+                    options.add(o)
+    return sorted(options)
 
 
 def get_submissions(form_id, api_key, start_date=None, end_date=None):
@@ -165,13 +157,13 @@ def get_submissions(form_id, api_key, start_date=None, end_date=None):
     return all_submissions
 
 
-def extract_row(sub, form_id, location_field_name):
+def extract_row(sub, form_id):
     """Pull out the fields we care about from one submission.
 
-    location_field_name is the exact internal field name of the real
-    location dropdown for this form (determined once via
-    get_location_field_name_and_options), so every submission is
-    matched consistently instead of re-guessing per row.
+    Uses the confirmed field name(s) for this form's location field(s)
+    (FORM_ID_TO_LOCATION_FIELDS). Where a form has two possible fields
+    (a duplicated location field across conditional branches), we check
+    each in order and use whichever one is actually filled in.
     """
     answers = sub['answers']
     row = {
@@ -182,30 +174,23 @@ def extract_row(sub, form_id, location_field_name):
         'location': None
     }
 
-    if location_field_name:
-        for k, v in answers.items():
-            if v.get('name') == location_field_name:
-                ans = v.get('answer', '')
-                row['location'] = ans if isinstance(ans, str) else str(ans)
-                break
+    by_name = {v.get('name'): v.get('answer', '') for v in answers.values()}
+    for field_name in FORM_ID_TO_LOCATION_FIELDS.get(form_id, []):
+        val = by_name.get(field_name)
+        if val not in (None, ''):
+            row['location'] = val if isinstance(val, str) else str(val)
+            break
 
     return row
 
 
-def get_all_data(form_names, location_list, start_date, end_date, api_key, field_name_cache=None):
+def get_all_data(form_names, location_list, start_date, end_date, api_key):
     all_rows = []
     form_ids = [FORM_NAME_TO_ID[name] for name in form_names]
-    if field_name_cache is None:
-        field_name_cache = {}
     for form_id in form_ids:
-        if form_id not in field_name_cache:
-            field_name, _ = get_location_field_name_and_options(form_id, api_key)
-            field_name_cache[form_id] = field_name
-        location_field_name = field_name_cache[form_id]
-
         submissions = get_submissions(form_id, api_key, start_date, end_date)
         for sub in submissions:
-            row = extract_row(sub, form_id, location_field_name)
+            row = extract_row(sub, form_id)
             if not location_list or row['location'] in location_list:
                 all_rows.append(row)
     df_raw = pd.DataFrame(all_rows)
@@ -312,6 +297,37 @@ if st.button("Debug Field Names"):
             else:
                 st.write("⚠️ No submissions returned at all for this form/date range")
 
+# ---- Debug button: shows full field SETUP (type, options) for any field ----
+# mentioning "location", across all forms. Use this when forms are dropping
+# out of the report entirely — it reveals exactly why a location field isn't
+# being detected (e.g. a different widget type than expected).
+if st.button("Debug Location Field Setup"):
+    if not api_key:
+        st.error("API Key is required!")
+    else:
+        for form_id in [FORM_NAME_TO_ID[n] for n in selected_forms]:
+            st.write(f"### {FORM_ID_TO_NAME[form_id]}")
+            questions = get_form_questions(form_id, api_key)
+            try:
+                items = sorted(questions.items(), key=lambda kv: int(kv[0]))
+            except (ValueError, TypeError):
+                items = list(questions.items())
+            candidates = [
+                q for (k, q) in items
+                if LOCATION_MATCH_WORD in str(q.get('name', '')).strip().lower()
+                or LOCATION_MATCH_WORD in str(q.get('text', '')).strip().lower()
+            ]
+            if not candidates:
+                st.write("⚠️ No fields mentioning 'location' found at all.")
+                continue
+            for q in candidates:
+                st.write({
+                    'name': q.get('name'),
+                    'text (label)': q.get('text'),
+                    'type': q.get('type'),
+                    'options': q.get('options'),
+                })
+
 # For the location picker: pull the REAL dropdown options straight from
 # each form's field setup, not from what people have actually submitted.
 # This avoids picking up write-in/free-text values that don't match the
@@ -322,12 +338,12 @@ if st.button("Load Locations"):
     else:
         all_options = set()
         for form_id in [FORM_NAME_TO_ID[n] for n in selected_forms]:
-            _, opts = get_location_field_name_and_options(form_id, api_key)
+            opts = get_location_options_for_form(form_id, api_key)
             if not opts:
                 st.warning(
                     f"Could not find dropdown location options for "
-                    f"'{FORM_ID_TO_NAME[form_id]}' — it may not use a "
-                    f"dropdown/select field for location."
+                    f"'{FORM_ID_TO_NAME[form_id]}' — check its confirmed "
+                    f"field name(s) in FORM_ID_TO_LOCATION_FIELDS."
                 )
             all_options.update(opts)
         locations = sorted(all_options)
