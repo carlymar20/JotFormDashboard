@@ -62,10 +62,19 @@ def get_submissions(form_id, api_key, start_date=None, end_date=None):
 def extract_row(sub, form_id):
     """Pull out the fields we care about from one submission.
 
-    Matches the location field by checking whether "location" appears in
-    either the field's internal name or its human-readable label, since
-    JotForm generates internal names independently per form and they can
-    differ even when the visible question is identical.
+    Most of these forms have TWO fields that look like "location":
+    - The real one, filled in near the top of the form.
+    - A second one near the bottom, right next to "Select Site Email",
+      which JotForm uses to route the notification email rather than to
+      record the actual audit location. This second one is often blank.
+
+    To avoid grabbing the wrong one, we walk the answers IN FORM ORDER
+    (sorted by question id) and take the FIRST field that:
+      - has "location" in its internal name or its label, AND
+      - does NOT have "email" in its name/label (filters out routing
+        fields like "Distribution Site (Location) Email"), AND
+      - does NOT start with "other" (filters out backup fields like
+        "Other Location Name").
     """
     answers = sub['answers']
     row = {
@@ -75,12 +84,30 @@ def extract_row(sub, form_id):
         'submitted_at': sub['created_at'],
         'location': None
     }
-    for k, v in answers.items():
+
+    # Sort by question id so we check fields in the order they appear on
+    # the form. Question ids are usually numeric strings; fall back to
+    # original order if they're not.
+    try:
+        items = sorted(answers.items(), key=lambda kv: int(kv[0]))
+    except (ValueError, TypeError):
+        items = list(answers.items())
+
+    for k, v in items:
         name = str(v.get('name', '')).strip().lower()
         label = str(v.get('text', '')).strip().lower()
-        if LOCATION_MATCH_WORD in name or LOCATION_MATCH_WORD in label:
-            ans = v.get('answer', '')
-            row['location'] = ans if isinstance(ans, str) else str(ans)
+
+        if LOCATION_MATCH_WORD not in name and LOCATION_MATCH_WORD not in label:
+            continue
+        if 'email' in name or 'email' in label:
+            continue
+        if name.startswith('other') or label.startswith('other'):
+            continue
+
+        ans = v.get('answer', '')
+        row['location'] = ans if isinstance(ans, str) else str(ans)
+        break  # stop at the first qualifying match
+
     return row
 
 
