@@ -282,51 +282,47 @@ selected_forms = st.multiselect("Select form(s):", options=form_names, default=f
 start_date = st.date_input("Start date")
 end_date = st.date_input("End date")
 
-# ---- Debug button: shows each form's actual field names/labels ----
-# Use this if submissions are visible in JotForm but missing from the report.
-# It tells you whether the "location" field is named consistently across forms.
-if st.button("Debug Field Names"):
-    if not api_key:
-        st.error("API Key is required!")
-    else:
-        for form_id in [FORM_NAME_TO_ID[n] for n in selected_forms]:
-            subs = get_submissions(form_id, api_key, start_date, end_date)
-            st.write(f"### {FORM_ID_TO_NAME[form_id]}")
-            if subs:
-                st.write({v['name']: v.get('text') for v in subs[0]['answers'].values()})
-            else:
-                st.write("⚠️ No submissions returned at all for this form/date range")
+# ---- Debug tools (collapsed by default) ----
+# Kept around in case something needs troubleshooting again down the road.
+with st.expander("🔧 Debug Tools (click to expand)", expanded=False):
+    if st.button("Debug Field Names"):
+        if not api_key:
+            st.error("API Key is required!")
+        else:
+            for form_id in [FORM_NAME_TO_ID[n] for n in selected_forms]:
+                subs = get_submissions(form_id, api_key, start_date, end_date)
+                st.write(f"### {FORM_ID_TO_NAME[form_id]}")
+                if subs:
+                    st.write({v['name']: v.get('text') for v in subs[0]['answers'].values()})
+                else:
+                    st.write("⚠️ No submissions returned at all for this form/date range")
 
-# ---- Debug button: shows full field SETUP (type, options) for any field ----
-# mentioning "location", across all forms. Use this when forms are dropping
-# out of the report entirely — it reveals exactly why a location field isn't
-# being detected (e.g. a different widget type than expected).
-if st.button("Debug Location Field Setup"):
-    if not api_key:
-        st.error("API Key is required!")
-    else:
-        for form_id in [FORM_NAME_TO_ID[n] for n in selected_forms]:
-            st.write(f"### {FORM_ID_TO_NAME[form_id]}")
-            questions = get_form_questions(form_id, api_key)
-            try:
-                items = sorted(questions.items(), key=lambda kv: int(kv[0]))
-            except (ValueError, TypeError):
-                items = list(questions.items())
-            candidates = [
-                q for (k, q) in items
-                if LOCATION_MATCH_WORD in str(q.get('name', '')).strip().lower()
-                or LOCATION_MATCH_WORD in str(q.get('text', '')).strip().lower()
-            ]
-            if not candidates:
-                st.write("⚠️ No fields mentioning 'location' found at all.")
-                continue
-            for q in candidates:
-                st.write({
-                    'name': q.get('name'),
-                    'text (label)': q.get('text'),
-                    'type': q.get('type'),
-                    'options': q.get('options'),
-                })
+    if st.button("Debug Location Field Setup"):
+        if not api_key:
+            st.error("API Key is required!")
+        else:
+            for form_id in [FORM_NAME_TO_ID[n] for n in selected_forms]:
+                st.write(f"### {FORM_ID_TO_NAME[form_id]}")
+                questions = get_form_questions(form_id, api_key)
+                try:
+                    items = sorted(questions.items(), key=lambda kv: int(kv[0]))
+                except (ValueError, TypeError):
+                    items = list(questions.items())
+                candidates = [
+                    q for (k, q) in items
+                    if LOCATION_MATCH_WORD in str(q.get('name', '')).strip().lower()
+                    or LOCATION_MATCH_WORD in str(q.get('text', '')).strip().lower()
+                ]
+                if not candidates:
+                    st.write("⚠️ No fields mentioning 'location' found at all.")
+                    continue
+                for q in candidates:
+                    st.write({
+                        'name': q.get('name'),
+                        'text (label)': q.get('text'),
+                        'type': q.get('type'),
+                        'options': q.get('options'),
+                    })
 
 # For the location picker: pull the REAL dropdown options straight from
 # each form's field setup, not from what people have actually submitted.
