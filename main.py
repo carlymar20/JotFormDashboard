@@ -3,6 +3,10 @@ import pandas as pd
 import requests
 import io
 import time
+import json
+import copy
+import gspread
+from google.oauth2.service_account import Credentials
 
 # -------- SETTINGS --------
 FORM_COMPLIANCE = {
@@ -15,6 +19,142 @@ FORM_COMPLIANCE = {
     "Parking/Work Area Hazard":       {"quota": 1, "interval": "weekly"},
     "Site Audit":                     {"quota": 1, "interval": "monthly"}
 }
+# Location-specific overrides for quota and/or interval, for locations
+# whose requirements differ from the standard FORM_COMPLIANCE default
+# above. Only list the locations that are DIFFERENT from the default —
+# any location not listed here just uses the form's default quota.
+#
+# Structure: { form_name: { location_name: {"quota": N, "interval": "daily"/"weekly"/"monthly"} } }
+# You can override just "quota", just "interval", or both — whatever key
+# is omitted falls back to the form's default from FORM_COMPLIANCE.
+#
+# Example:
+# LOCATION_COMPLIANCE_OVERRIDES = {
+#     "Daily Huddle": {
+#         "Downtown Garage": {"quota": 2},       # only needs 2/day instead of 3
+#         "Airport Lot":     {"quota": 5},       # busier site, needs 5/day
+#     },
+# }
+LOCATION_COMPLIANCE_OVERRIDES = {
+    # "Daily Huddle": {
+    #     "Downtown Garage": {"quota": 2},
+    # },
+}
+
+
+def get_requirement_for(form_name, location, overrides=None):
+    """Return the effective {"quota": ..., "interval": ...} requirement
+    for this form/location, applying any location-specific override on
+    top of the form's default from FORM_COMPLIANCE.
+
+    `overrides` defaults to the hardcoded LOCATION_COMPLIANCE_OVERRIDES
+    constant, but the UI passes in the live, in-app-editable version from
+    st.session_state instead so users can adjust overrides without
+    touching code.
+    """
+    if overrides is None:
+        overrides = LOCATION_COMPLIANCE_OVERRIDES
+    default = FORM_COMPLIANCE.get(form_name)
+    if default is None:
+        return None
+    override = overrides.get(form_name, {}).get(location, {})
+    return {
+        "quota": override.get("quota", default["quota"]),
+        "interval": override.get("interval", default["interval"]),
+    }
+
+
+def overrides_to_df(overrides):
+    """Flatten the nested overrides dict into a table for st.data_editor."""
+    rows = []
+    for form_name, locs in overrides.items():
+        for loc, vals in locs.items():
+            default = FORM_COMPLIANCE.get(form_name) or {}
+            rows.append({
+                "Form": form_name,
+                "Location": loc,
+                "Quota": vals.get("quota", default.get("quota")),
+                "Interval": vals.get("interval", default.get("interval")),
+            })
+    if not rows:
+        rows = [{"Form": None, "Location": None, "Quota": None, "Interval": None}][:0]
+    return pd.DataFrame(rows, columns=["Form", "Location", "Quota", "Interval"])
+
+
+def df_to_overrides(df):
+    """Rebuild the nested overrides dict from the edited table. Rows with
+    a missing Form, Location, or Quota are skipped (e.g. a blank row left
+    over from the data editor's "add row" affordance)."""
+    overrides = {}
+    for _, row in df.iterrows():
+        form_name = row.get("Form")
+        loc = row.get("Location")
+        quota = row.get("Quota")
+        interval = row.get("Interval")
+        if not form_name or not loc or pd.isna(quota):
+            continue
+        overrides.setdefault(form_name, {})[loc] = {
+            "quota": int(quota),
+            "interval": interval if interval in ("daily", "weekly", "monthly") else FORM_COMPLIANCE[form_name]["interval"],
+        }
+    return overrides
+
+
+# ---- Google Sheets persistence for the overrides table ----
+# Requires a Google Cloud service account with the Sheets API enabled,
+# whose credentials are stored in Streamlit secrets under
+# [gcp_service_account], and the target Google Sheet shared with that
+# service account's email (found in the credentials as "client_email").
+GOOGLE_SHEETS_SCOPES = [
+    "https://www.googleapis.com/auth/spreadsheets",
+    "https://www.googleapis.com/auth/drive.file",
+]
+OVERRIDES_HEADER = ["Form", "Location", "Quota", "Interval"]
+
+
+def get_gsheet_client():
+    """Build an authenticated gspread client from the service account
+    credentials stored in Streamlit secrets."""
+    creds_dict = dict(st.secrets["gcp_service_account"])
+    creds = Credentials.from_service_account_info(creds_dict, scopes=GOOGLE_SHEETS_SCOPES)
+    return gspread.authorize(creds)
+
+
+def _open_overrides_sheet(sheet_url_or_key):
+    """Open the target spreadsheet by URL or by key, and return its
+    first worksheet."""
+    gc = get_gsheet_client()
+    if sheet_url_or_key.startswith("http"):
+        sh = gc.open_by_url(sheet_url_or_key)
+    else:
+        sh = gc.open_by_key(sheet_url_or_key)
+    return sh.sheet1
+
+
+def load_overrides_from_sheet(sheet_url_or_key):
+    """Read the overrides table from the sheet and return it as the
+    nested overrides dict. Returns an empty dict if the sheet has no
+    data rows yet."""
+    ws = _open_overrides_sheet(sheet_url_or_key)
+    records = ws.get_all_records()  # uses row 1 as the header
+    if not records:
+        return {}
+    df = pd.DataFrame(records)
+    for col in OVERRIDES_HEADER:
+        if col not in df.columns:
+            df[col] = None
+    return df_to_overrides(df[OVERRIDES_HEADER])
+
+
+def save_overrides_to_sheet(overrides, sheet_url_or_key):
+    """Overwrite the sheet's contents with the current overrides table."""
+    ws = _open_overrides_sheet(sheet_url_or_key)
+    df = overrides_to_df(overrides)
+    ws.clear()
+    values = [OVERRIDES_HEADER] + df[OVERRIDES_HEADER].astype(object).where(pd.notna(df), "").values.tolist()
+    ws.update(values)
+
+
 FORM_ID_TO_NAME = {
     "250265807744158": "AWEstruck Arival/Departure",
     "242047162465151": "Daily Huddle",
@@ -197,33 +337,60 @@ def get_all_data(form_names, location_list, start_date, end_date, api_key):
     return df_raw
 
 
-def compute_period_targets(df_raw, start_date, end_date, selected_forms, selected_locations):
+def _period_count(interval, start_date, end_date):
+    """Number of compliance periods (days/weeks/months) in the date range
+    for the given interval."""
+    if interval == "daily":
+        periods = pd.date_range(start_date, end_date, freq='D')
+    elif interval == "weekly":
+        periods = pd.date_range(start_date, end_date, freq='W-MON')
+        if pd.to_datetime(start_date).weekday() != 0:
+            periods = periods.insert(0, pd.to_datetime(start_date))
+    elif interval == "monthly":
+        periods = pd.period_range(start_date, end_date, freq='M')
+    else:
+        periods = []
+    return len(periods)
+
+
+def compute_period_targets(df_raw, start_date, end_date, selected_forms, selected_locations, overrides=None):
+    """Build the compliance summary, one row per (form, location).
+
+    Quota/interval requirements are resolved per (form, location) via
+    get_requirement_for(), so locations listed in `overrides` (typically
+    st.session_state['location_overrides'], edited live in the UI) get
+    their own target instead of the form's default quota. Because
+    interval can also differ per location, the period count is computed
+    per row rather than once per form.
+    """
+    if overrides is None:
+        overrides = LOCATION_COMPLIANCE_OVERRIDES
     summary_rows = []
     compliance_forms = [f for f in selected_forms if FORM_COMPLIANCE.get(f)]
     all_locations = selected_locations if selected_locations else sorted(df_raw['location'].dropna().unique())
+
+    # Cache period counts by interval so we don't recompute the same
+    # date_range/period_range repeatedly for every location.
+    period_count_cache = {}
+
     for form_name in compliance_forms:
-        req = FORM_COMPLIANCE.get(form_name)
-        if req is None:
-            continue
-        quota = req['quota']
-        interval = req['interval']
-        if interval == "daily":
-            periods = pd.date_range(start_date, end_date, freq='D')
-        elif interval == "weekly":
-            periods = pd.date_range(start_date, end_date, freq='W-MON')
-            if pd.to_datetime(start_date).weekday() != 0:
-                periods = periods.insert(0, pd.to_datetime(start_date))
-        elif interval == "monthly":
-            periods = pd.period_range(start_date, end_date, freq='M')
-        else:
-            periods = []
-        period_count = len(periods)
         for loc in all_locations:
+            req = get_requirement_for(form_name, loc, overrides)
+            if req is None:
+                continue
+            quota = req['quota']
+            interval = req['interval']
+
+            if interval not in period_count_cache:
+                period_count_cache[interval] = _period_count(interval, start_date, end_date)
+            period_count = period_count_cache[interval]
+
             df_form_loc = df_raw[(df_raw['form_name'] == form_name) & (df_raw['location'] == loc)]
             actual = len(df_form_loc)
             target = period_count * quota
             percent_complete = 100 * actual / target if target else 0
             status = "Met" if actual >= target else f"Missing {target - actual}"
+            is_override = loc in overrides.get(form_name, {})
             summary_rows.append({
                 "form_name": form_name,
                 "location": loc,
@@ -233,7 +400,8 @@ def compute_period_targets(df_raw, start_date, end_date, selected_forms, selecte
                 "target_total": target,
                 "actual_total": actual,
                 "percent_complete": round(percent_complete, 1),
-                "status": status
+                "status": status,
+                "custom_quota": "Yes" if is_override else "No"
             })
     summary_df = pd.DataFrame(summary_rows)
     return summary_df
@@ -316,6 +484,131 @@ selected_locations = st.multiselect(
     key='selected_locations_widget'
 )
 
+# ---- Location Quota Overrides editor ----
+# Seed session state from the hardcoded LOCATION_COMPLIANCE_OVERRIDES the
+# first time the app runs. After that, the in-app table (or whatever was
+# last loaded from the Google Sheet) is the source of truth for the rest
+# of the session.
+if 'location_overrides' not in st.session_state:
+    st.session_state['location_overrides'] = copy.deepcopy(LOCATION_COMPLIANCE_OVERRIDES)
+
+# The sheet URL/ID defaults to a value in secrets if you set one
+# (st.secrets["overrides_sheet_url"]), so the team doesn't have to
+# re-paste it every session — but it can still be overridden per-session
+# in the text box below.
+if 'overrides_sheet_url' not in st.session_state:
+    st.session_state['overrides_sheet_url'] = st.secrets.get("overrides_sheet_url", "")
+
+compliance_form_names = [f for f in FORM_NAME_TO_ID if FORM_COMPLIANCE.get(f)]
+
+with st.expander("⚙️ Location Quota Overrides", expanded=False):
+    st.caption(
+        "Set a different quota (and, if needed, a different interval) for "
+        "specific locations. Any location not listed here just uses the "
+        "form's standard quota. Add a row, fill in Form/Location/Quota, "
+        "and it takes effect on the next 'Run Report'."
+    )
+
+    edited_df = st.data_editor(
+        overrides_to_df(st.session_state['location_overrides']),
+        num_rows="dynamic",
+        use_container_width=True,
+        key="overrides_editor",
+        column_config={
+            "Form": st.column_config.SelectboxColumn(
+                "Form", options=compliance_form_names, required=True
+            ),
+            "Location": st.column_config.SelectboxColumn(
+                "Location", options=locations if locations else None, required=True
+            ) if locations else st.column_config.TextColumn("Location", required=True),
+            "Quota": st.column_config.NumberColumn(
+                "Quota", min_value=0, step=1, required=True
+            ),
+            "Interval": st.column_config.SelectboxColumn(
+                "Interval", options=["daily", "weekly", "monthly"], required=True
+            ),
+        }
+    )
+    st.session_state['location_overrides'] = df_to_overrides(edited_df)
+
+    st.divider()
+    st.markdown("**Google Sheet sync** (recommended — persists across sessions and app restarts)")
+    st.session_state['overrides_sheet_url'] = st.text_input(
+        "Google Sheet URL or ID",
+        value=st.session_state['overrides_sheet_url'],
+        help="The sheet must be shared (Editor access) with your service "
+             "account's email — found as 'client_email' in your "
+             "st.secrets['gcp_service_account'] credentials."
+    )
+
+    col_a, col_b = st.columns(2)
+    with col_a:
+        if st.button("⬇️ Load from Google Sheet"):
+            if not st.session_state['overrides_sheet_url']:
+                st.error("Enter a Google Sheet URL or ID first.")
+            else:
+                try:
+                    st.session_state['location_overrides'] = load_overrides_from_sheet(
+                        st.session_state['overrides_sheet_url']
+                    )
+                    st.success("Loaded overrides from the Google Sheet.")
+                    st.rerun()
+                except gspread.exceptions.SpreadsheetNotFound:
+                    st.error(
+                        "Sheet not found. Check the URL/ID and make sure it's "
+                        "shared with the service account's client_email."
+                    )
+                except gspread.exceptions.APIError as e:
+                    st.error(f"Google Sheets API error: {e}")
+                except KeyError:
+                    st.error(
+                        "No 'gcp_service_account' credentials found in "
+                        "st.secrets — add your service account JSON there first."
+                    )
+    with col_b:
+        if st.button("⬆️ Save to Google Sheet"):
+            if not st.session_state['overrides_sheet_url']:
+                st.error("Enter a Google Sheet URL or ID first.")
+            else:
+                try:
+                    save_overrides_to_sheet(
+                        st.session_state['location_overrides'],
+                        st.session_state['overrides_sheet_url']
+                    )
+                    st.success("Saved overrides to the Google Sheet.")
+                except gspread.exceptions.SpreadsheetNotFound:
+                    st.error(
+                        "Sheet not found. Check the URL/ID and make sure it's "
+                        "shared with the service account's client_email."
+                    )
+                except gspread.exceptions.APIError as e:
+                    st.error(f"Google Sheets API error: {e}")
+                except KeyError:
+                    st.error(
+                        "No 'gcp_service_account' credentials found in "
+                        "st.secrets — add your service account JSON there first."
+                    )
+
+    with st.expander("Backup as a local file instead"):
+        col_c, col_d = st.columns(2)
+        with col_c:
+            st.download_button(
+                "Save overrides to file",
+                data=json.dumps(st.session_state['location_overrides'], indent=2),
+                file_name="location_quota_overrides.json",
+                mime="application/json"
+            )
+        with col_d:
+            uploaded_overrides = st.file_uploader(
+                "Load overrides from file", type=["json"], key="overrides_uploader"
+            )
+            if uploaded_overrides is not None:
+                try:
+                    st.session_state['location_overrides'] = json.load(uploaded_overrides)
+                    st.success("Overrides loaded. Expand this section to review them.")
+                except (json.JSONDecodeError, ValueError):
+                    st.error("That file doesn't look like a valid overrides JSON export.")
+
 if st.button("Run Report"):
     if not api_key:
         st.error("API Key is required!")
@@ -324,7 +617,10 @@ if st.button("Run Report"):
         if df_raw.empty:
             st.warning("No submissions found for this selection.")
         else:
-            compliance_summary = compute_period_targets(df_raw, start_date, end_date, selected_forms, selected_locations)
+            compliance_summary = compute_period_targets(
+                df_raw, start_date, end_date, selected_forms, selected_locations,
+                overrides=st.session_state.get('location_overrides', LOCATION_COMPLIANCE_OVERRIDES)
+            )
             leaderboard = leaderboard_with_badges(compliance_summary)
 
             st.subheader("Compliance Summary")
