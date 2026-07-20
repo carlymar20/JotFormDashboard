@@ -3,6 +3,10 @@ import pandas as pd
 import requests
 import io
 import time
+import json
+import copy
+import gspread
+from google.oauth2.service_account import Credentials
 
 # -------- SETTINGS --------
 FORM_COMPLIANCE = {
@@ -15,6 +19,252 @@ FORM_COMPLIANCE = {
     "Parking/Work Area Hazard":       {"quota": 1, "interval": "weekly"},
     "Site Audit":                     {"quota": 1, "interval": "monthly"}
 }
+# Location-specific overrides for quota and/or interval, for locations
+# whose requirements differ from the standard FORM_COMPLIANCE default
+# above. Only list the locations that are DIFFERENT from the default —
+# any location not listed here just uses the form's default quota.
+#
+# Structure: { form_name: { location_name: {"quota": N, "interval": "daily"/"weekly"/"monthly"} } }
+# You can override just "quota", just "interval", or both — whatever key
+# is omitted falls back to the form's default from FORM_COMPLIANCE.
+#
+# Example:
+# LOCATION_COMPLIANCE_OVERRIDES = {
+#     "Daily Huddle": {
+#         "Downtown Garage": {"quota": 2},       # only needs 2/day instead of 3
+#         "Airport Lot":     {"quota": 5},       # busier site, needs 5/day
+#     },
+# }
+LOCATION_COMPLIANCE_OVERRIDES = {
+    # "Daily Huddle": {
+    #     "Downtown Garage": {"quota": 2},
+    # },
+}
+
+
+def get_requirement_for(form_name, location, overrides=None):
+    """Return the effective {"quota": ..., "interval": ...} requirement
+    for this form/location, applying any location-specific override on
+    top of the form's default from FORM_COMPLIANCE.
+
+    `overrides` defaults to the hardcoded LOCATION_COMPLIANCE_OVERRIDES
+    constant, but the UI passes in the live, in-app-editable version from
+    st.session_state instead so users can adjust overrides without
+    touching code.
+    """
+    if overrides is None:
+        overrides = LOCATION_COMPLIANCE_OVERRIDES
+    default = FORM_COMPLIANCE.get(form_name)
+    if default is None:
+        return None
+    override = overrides.get(form_name, {}).get(location, {})
+    return {
+        "quota": override.get("quota", default["quota"]),
+        "interval": override.get("interval", default["interval"]),
+    }
+
+
+# Which locations aren't open all 7 days a week. Any location NOT listed
+# here is assumed open every day. Days are Python's weekday() numbering:
+# 0=Mon, 1=Tue, 2=Wed, 3=Thu, 4=Fri, 5=Sat, 6=Sun.
+#
+# This only affects DAILY-interval forms (Daily Huddle, Key Scrub, Lot
+# Audit, Overnight Valet): the daily target is based on how many days the
+# location is actually open in the date range, not every calendar day.
+# Weekly/monthly quotas are unaffected — a location still needs to hit
+# those regardless of which specific days it's open.
+#
+# Example:
+# LOCATION_OPERATING_DAYS = {
+#     "Downtown Garage": {0, 1, 2, 3, 4},        # 5-day: Mon-Fri, closed weekends
+#     "Airport Lot":      {0, 1, 2, 3, 4, 5},    # 6-day: Mon-Sat, closed Sunday
+# }
+LOCATION_OPERATING_DAYS = {
+    # "Downtown Garage": {0, 1, 2, 3, 4},
+}
+
+WEEKDAY_COLUMNS = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
+OPERATING_DAYS_HEADER = ["Location"] + WEEKDAY_COLUMNS
+
+
+def get_operating_days_for(location, operating_days=None):
+    """Return the set of weekday ints (0=Mon..6=Sun) this location is
+    open on. Defaults to every day if the location isn't listed."""
+    if operating_days is None:
+        operating_days = LOCATION_OPERATING_DAYS
+    return operating_days.get(location, set(range(7)))
+
+
+def operating_days_to_df(operating_days):
+    """Flatten the operating-days dict into a table for st.data_editor,
+    one row per location with a checkbox column per weekday."""
+    rows = []
+    for loc, days in operating_days.items():
+        row = {"Location": loc}
+        for i, col in enumerate(WEEKDAY_COLUMNS):
+            row[col] = i in days
+        rows.append(row)
+    return pd.DataFrame(rows, columns=OPERATING_DAYS_HEADER)
+
+
+def _truthy(val):
+    """Handle both real booleans (from the in-app editor) and the
+    'TRUE'/'FALSE' strings gspread returns after a Google Sheets round trip."""
+    if isinstance(val, bool):
+        return val
+    return str(val).strip().upper() in ("TRUE", "1", "YES")
+
+
+def df_to_operating_days(df):
+    """Rebuild the operating-days dict from the edited table. A location
+    with every day checked is dropped (that's just the default), and a
+    location with every day UNCHECKED is dropped too (an empty row from
+    the editor's 'add row' affordance, not a real 0-day location)."""
+    operating_days = {}
+    for _, row in df.iterrows():
+        loc = row.get("Location")
+        if not loc:
+            continue
+        days = {i for i, col in enumerate(WEEKDAY_COLUMNS) if _truthy(row.get(col))}
+        if days and len(days) < 7:
+            operating_days[loc] = days
+    return operating_days
+
+
+def overrides_to_df(overrides):
+    """Flatten the nested overrides dict into a table for st.data_editor."""
+    rows = []
+    for form_name, locs in overrides.items():
+        for loc, vals in locs.items():
+            default = FORM_COMPLIANCE.get(form_name) or {}
+            rows.append({
+                "Form": form_name,
+                "Location": loc,
+                "Quota": vals.get("quota", default.get("quota")),
+                "Interval": vals.get("interval", default.get("interval")),
+            })
+    if not rows:
+        rows = [{"Form": None, "Location": None, "Quota": None, "Interval": None}][:0]
+    return pd.DataFrame(rows, columns=["Form", "Location", "Quota", "Interval"])
+
+
+def df_to_overrides(df):
+    """Rebuild the nested overrides dict from the edited table. Rows with
+    a missing Form, Location, or Quota are skipped (e.g. a blank row left
+    over from the data editor's "add row" affordance)."""
+    overrides = {}
+    for _, row in df.iterrows():
+        form_name = row.get("Form")
+        loc = row.get("Location")
+        quota = row.get("Quota")
+        interval = row.get("Interval")
+        if not form_name or not loc or pd.isna(quota):
+            continue
+        overrides.setdefault(form_name, {})[loc] = {
+            "quota": int(quota),
+            "interval": interval if interval in ("daily", "weekly", "monthly") else FORM_COMPLIANCE[form_name]["interval"],
+        }
+    return overrides
+
+
+# ---- Google Sheets persistence for the overrides table ----
+# Requires a Google Cloud service account with the Sheets API enabled,
+# whose credentials are stored in Streamlit secrets under
+# [gcp_service_account], and the target Google Sheet shared with that
+# service account's email (found in the credentials as "client_email").
+# ---- Google Sheets persistence for overrides + operating days ----
+# Requires a Google Cloud service account with the Sheets API enabled,
+# whose credentials are stored in Streamlit secrets under
+# [gcp_service_account], and the target Google Sheet shared with that
+# service account's email (found in the credentials as "client_email").
+#
+# Two tabs are used in the same spreadsheet:
+#   - "Sheet1" (the default first tab)  -> quota overrides
+#   - "Operating Days" (created automatically if missing) -> which days
+#     each location is open
+GOOGLE_SHEETS_SCOPES = [
+    "https://www.googleapis.com/auth/spreadsheets",
+    "https://www.googleapis.com/auth/drive.file",
+]
+OVERRIDES_HEADER = ["Form", "Location", "Quota", "Interval"]
+
+
+def get_gsheet_client():
+    """Build an authenticated gspread client from the service account
+    credentials stored in Streamlit secrets."""
+    creds_dict = dict(st.secrets["gcp_service_account"])
+    creds = Credentials.from_service_account_info(creds_dict, scopes=GOOGLE_SHEETS_SCOPES)
+    return gspread.authorize(creds)
+
+
+def _open_spreadsheet(sheet_url_or_key):
+    """Open the target spreadsheet by URL or by key."""
+    gc = get_gsheet_client()
+    if sheet_url_or_key.startswith("http"):
+        return gc.open_by_url(sheet_url_or_key)
+    return gc.open_by_key(sheet_url_or_key)
+
+
+def _get_or_create_worksheet(sh, title, rows=200, cols=10):
+    """Return the named worksheet, creating it (blank) if it doesn't exist yet."""
+    try:
+        return sh.worksheet(title)
+    except gspread.exceptions.WorksheetNotFound:
+        return sh.add_worksheet(title=title, rows=rows, cols=cols)
+
+
+def load_overrides_from_sheet(sheet_url_or_key):
+    """Read the overrides table from the sheet and return it as the
+    nested overrides dict. Returns an empty dict if the sheet has no
+    data rows yet."""
+    sh = _open_spreadsheet(sheet_url_or_key)
+    ws = sh.sheet1
+    records = ws.get_all_records()  # uses row 1 as the header
+    if not records:
+        return {}
+    df = pd.DataFrame(records)
+    for col in OVERRIDES_HEADER:
+        if col not in df.columns:
+            df[col] = None
+    return df_to_overrides(df[OVERRIDES_HEADER])
+
+
+def save_overrides_to_sheet(overrides, sheet_url_or_key):
+    """Overwrite the sheet's contents with the current overrides table."""
+    sh = _open_spreadsheet(sheet_url_or_key)
+    ws = sh.sheet1
+    df = overrides_to_df(overrides)
+    ws.clear()
+    values = [OVERRIDES_HEADER] + df[OVERRIDES_HEADER].astype(object).where(pd.notna(df), "").values.tolist()
+    ws.update(values)
+
+
+def load_operating_days_from_sheet(sheet_url_or_key):
+    """Read the 'Operating Days' tab and return it as the operating-days
+    dict. Returns an empty dict (= everyone open 7 days) if the tab is
+    missing or has no data rows yet."""
+    sh = _open_spreadsheet(sheet_url_or_key)
+    ws = _get_or_create_worksheet(sh, "Operating Days")
+    records = ws.get_all_records()
+    if not records:
+        return {}
+    df = pd.DataFrame(records)
+    for col in OPERATING_DAYS_HEADER:
+        if col not in df.columns:
+            df[col] = False
+    return df_to_operating_days(df[OPERATING_DAYS_HEADER])
+
+
+def save_operating_days_to_sheet(operating_days, sheet_url_or_key):
+    """Overwrite the 'Operating Days' tab with the current table."""
+    sh = _open_spreadsheet(sheet_url_or_key)
+    ws = _get_or_create_worksheet(sh, "Operating Days")
+    df = operating_days_to_df(operating_days)
+    ws.clear()
+    values = [OPERATING_DAYS_HEADER] + df[OPERATING_DAYS_HEADER].values.tolist()
+    ws.update(values)
+
+
 FORM_ID_TO_NAME = {
     "250265807744158": "AWEstruck Arival/Departure",
     "242047162465151": "Daily Huddle",
@@ -197,33 +447,84 @@ def get_all_data(form_names, location_list, start_date, end_date, api_key):
     return df_raw
 
 
-def compute_period_targets(df_raw, start_date, end_date, selected_forms, selected_locations):
+def _period_count(interval, start_date, end_date, operating_days=None):
+    """Number of compliance periods (days/weeks/months) in the date range
+    for the given interval.
+
+    For "daily" intervals, `operating_days` (a set of weekday ints,
+    0=Mon..6=Sun) restricts the count to only the days the location is
+    actually open — a 5-day location gets ~5/7 as many required days as
+    a 7-day location over the same date range. Weekly/monthly intervals
+    ignore `operating_days`: those quotas still apply regardless of which
+    specific days the location is open.
+    """
+    if interval == "daily":
+        periods = pd.date_range(start_date, end_date, freq='D')
+        if operating_days is not None and len(operating_days) < 7:
+            periods = [d for d in periods if d.weekday() in operating_days]
+    elif interval == "weekly":
+        periods = pd.date_range(start_date, end_date, freq='W-MON')
+        if pd.to_datetime(start_date).weekday() != 0:
+            periods = periods.insert(0, pd.to_datetime(start_date))
+    elif interval == "monthly":
+        periods = pd.period_range(start_date, end_date, freq='M')
+    else:
+        periods = []
+    return len(periods)
+
+
+def compute_period_targets(df_raw, start_date, end_date, selected_forms, selected_locations,
+                            overrides=None, operating_days=None):
+    """Build the compliance summary, one row per (form, location).
+
+    Quota/interval requirements are resolved per (form, location) via
+    get_requirement_for(), so locations listed in `overrides` (typically
+    st.session_state['location_overrides'], edited live in the UI) get
+    their own target instead of the form's default quota. Because
+    interval can also differ per location, the period count is computed
+    per row rather than once per form.
+
+    `operating_days` (typically st.session_state['location_operating_days'])
+    trims the daily-interval period count down to just the days each
+    location is actually open, for locations that aren't open 7 days/week.
+    """
+    if overrides is None:
+        overrides = LOCATION_COMPLIANCE_OVERRIDES
+    if operating_days is None:
+        operating_days = LOCATION_OPERATING_DAYS
     summary_rows = []
     compliance_forms = [f for f in selected_forms if FORM_COMPLIANCE.get(f)]
     all_locations = selected_locations if selected_locations else sorted(df_raw['location'].dropna().unique())
+
+    # Cache period counts by (interval, operating-days-set) so we don't
+    # recompute the same date_range/period_range repeatedly. Weekly/monthly
+    # don't depend on operating days, so they share one cache entry.
+    period_count_cache = {}
+
     for form_name in compliance_forms:
-        req = FORM_COMPLIANCE.get(form_name)
-        if req is None:
-            continue
-        quota = req['quota']
-        interval = req['interval']
-        if interval == "daily":
-            periods = pd.date_range(start_date, end_date, freq='D')
-        elif interval == "weekly":
-            periods = pd.date_range(start_date, end_date, freq='W-MON')
-            if pd.to_datetime(start_date).weekday() != 0:
-                periods = periods.insert(0, pd.to_datetime(start_date))
-        elif interval == "monthly":
-            periods = pd.period_range(start_date, end_date, freq='M')
-        else:
-            periods = []
-        period_count = len(periods)
         for loc in all_locations:
+            req = get_requirement_for(form_name, loc, overrides)
+            if req is None:
+                continue
+            quota = req['quota']
+            interval = req['interval']
+            loc_days = get_operating_days_for(loc, operating_days)
+
+            cache_key = (interval, frozenset(loc_days)) if interval == "daily" else (interval, None)
+            if cache_key not in period_count_cache:
+                period_count_cache[cache_key] = _period_count(
+                    interval, start_date, end_date,
+                    loc_days if interval == "daily" else None
+                )
+            period_count = period_count_cache[cache_key]
+
             df_form_loc = df_raw[(df_raw['form_name'] == form_name) & (df_raw['location'] == loc)]
             actual = len(df_form_loc)
             target = period_count * quota
             percent_complete = 100 * actual / target if target else 0
             status = "Met" if actual >= target else f"Missing {target - actual}"
+            is_override = loc in overrides.get(form_name, {})
+            is_partial_week = interval == "daily" and len(loc_days) < 7
             summary_rows.append({
                 "form_name": form_name,
                 "location": loc,
@@ -233,7 +534,9 @@ def compute_period_targets(df_raw, start_date, end_date, selected_forms, selecte
                 "target_total": target,
                 "actual_total": actual,
                 "percent_complete": round(percent_complete, 1),
-                "status": status
+                "status": status,
+                "custom_quota": "Yes" if is_override else "No",
+                "open_days_per_week": len(loc_days) if is_partial_week else 7
             })
     summary_df = pd.DataFrame(summary_rows)
     return summary_df
@@ -320,6 +623,239 @@ selected_locations = st.multiselect(
     key='selected_locations_widget'
 )
 
+# ---- Location Quota Overrides editor ----
+# Seed session state from the hardcoded LOCATION_COMPLIANCE_OVERRIDES the
+# first time the app runs. After that, the in-app table (or whatever was
+# last loaded from the Google Sheet) is the source of truth for the rest
+# of the session.
+if 'location_overrides' not in st.session_state:
+    st.session_state['location_overrides'] = copy.deepcopy(LOCATION_COMPLIANCE_OVERRIDES)
+
+# The sheet URL/ID defaults to a value in secrets if you set one
+# (st.secrets["overrides_sheet_url"]), so the team doesn't have to
+# re-paste it every session — but it can still be overridden per-session
+# in the text box below.
+if 'overrides_sheet_url' not in st.session_state:
+    st.session_state['overrides_sheet_url'] = st.secrets.get("overrides_sheet_url", "")
+
+compliance_form_names = [f for f in FORM_NAME_TO_ID if FORM_COMPLIANCE.get(f)]
+
+with st.expander("⚙️ Location Quota Overrides", expanded=False):
+    st.caption(
+        "Set a different quota (and, if needed, a different interval) for "
+        "specific locations. Any location not listed here just uses the "
+        "form's standard quota. Add a row, fill in Form/Location/Quota, "
+        "and it takes effect on the next 'Run Report'."
+    )
+
+    edited_df = st.data_editor(
+        overrides_to_df(st.session_state['location_overrides']),
+        num_rows="dynamic",
+        use_container_width=True,
+        key="overrides_editor",
+        column_config={
+            "Form": st.column_config.SelectboxColumn(
+                "Form", options=compliance_form_names, required=True
+            ),
+            "Location": st.column_config.SelectboxColumn(
+                "Location", options=locations if locations else None, required=True
+            ) if locations else st.column_config.TextColumn("Location", required=True),
+            "Quota": st.column_config.NumberColumn(
+                "Quota", min_value=0, step=1, required=True
+            ),
+            "Interval": st.column_config.SelectboxColumn(
+                "Interval", options=["daily", "weekly", "monthly"], required=True
+            ),
+        }
+    )
+    st.session_state['location_overrides'] = df_to_overrides(edited_df)
+
+    st.divider()
+    st.markdown("**Google Sheet sync** (recommended — persists across sessions and app restarts)")
+    st.session_state['overrides_sheet_url'] = st.text_input(
+        "Google Sheet URL or ID",
+        value=st.session_state['overrides_sheet_url'],
+        help="The sheet must be shared (Editor access) with your service "
+             "account's email — found as 'client_email' in your "
+             "st.secrets['gcp_service_account'] credentials."
+    )
+
+    col_a, col_b = st.columns(2)
+    with col_a:
+        if st.button("⬇️ Load from Google Sheet"):
+            if not st.session_state['overrides_sheet_url']:
+                st.error("Enter a Google Sheet URL or ID first.")
+            else:
+                try:
+                    st.session_state['location_overrides'] = load_overrides_from_sheet(
+                        st.session_state['overrides_sheet_url']
+                    )
+                    st.success("Loaded overrides from the Google Sheet.")
+                    st.rerun()
+                except gspread.exceptions.SpreadsheetNotFound:
+                    st.error(
+                        "Sheet not found. Check the URL/ID and make sure it's "
+                        "shared with the service account's client_email."
+                    )
+                except gspread.exceptions.APIError as e:
+                    st.error(f"Google Sheets API error: {e}")
+                except KeyError:
+                    st.error(
+                        "No 'gcp_service_account' credentials found in "
+                        "st.secrets — add your service account JSON there first."
+                    )
+    with col_b:
+        if st.button("⬆️ Save to Google Sheet"):
+            if not st.session_state['overrides_sheet_url']:
+                st.error("Enter a Google Sheet URL or ID first.")
+            else:
+                try:
+                    save_overrides_to_sheet(
+                        st.session_state['location_overrides'],
+                        st.session_state['overrides_sheet_url']
+                    )
+                    st.success("Saved overrides to the Google Sheet.")
+                except gspread.exceptions.SpreadsheetNotFound:
+                    st.error(
+                        "Sheet not found. Check the URL/ID and make sure it's "
+                        "shared with the service account's client_email."
+                    )
+                except gspread.exceptions.APIError as e:
+                    st.error(f"Google Sheets API error: {e}")
+                except KeyError:
+                    st.error(
+                        "No 'gcp_service_account' credentials found in "
+                        "st.secrets — add your service account JSON there first."
+                    )
+
+    with st.expander("Backup as a local file instead"):
+        col_c, col_d = st.columns(2)
+        with col_c:
+            st.download_button(
+                "Save overrides to file",
+                data=json.dumps(st.session_state['location_overrides'], indent=2),
+                file_name="location_quota_overrides.json",
+                mime="application/json"
+            )
+        with col_d:
+            uploaded_overrides = st.file_uploader(
+                "Load overrides from file", type=["json"], key="overrides_uploader"
+            )
+            if uploaded_overrides is not None:
+                try:
+                    st.session_state['location_overrides'] = json.load(uploaded_overrides)
+                    st.success("Overrides loaded. Expand this section to review them.")
+                except (json.JSONDecodeError, ValueError):
+                    st.error("That file doesn't look like a valid overrides JSON export.")
+
+# ---- Location Operating Days editor ----
+# For locations that aren't open 7 days a week (5-day or 6-day sites),
+# this trims the DAILY-quota targets down to just the days they're
+# actually open, so a 5-day lot isn't held to the same daily target as a
+# 7-day lot. Weekly/monthly quotas are unaffected.
+if 'location_operating_days' not in st.session_state:
+    st.session_state['location_operating_days'] = copy.deepcopy(LOCATION_OPERATING_DAYS)
+
+with st.expander("📅 Location Operating Days (5/6-day locations)", expanded=False):
+    st.caption(
+        "Only add a location here if it's NOT open all 7 days a week. "
+        "Check the days it IS open (e.g. check Mon–Fri and leave Sat/Sun "
+        "unchecked for a 5-day site). Locations left off this list are "
+        "assumed open every day. This only affects daily-quota forms "
+        "(Daily Huddle, Key Scrub, Lot Audit, Overnight Valet) — weekly "
+        "and monthly quotas are unchanged."
+    )
+
+    days_edited_df = st.data_editor(
+        operating_days_to_df(st.session_state['location_operating_days']),
+        num_rows="dynamic",
+        use_container_width=True,
+        key="operating_days_editor",
+        column_config={
+            "Location": st.column_config.SelectboxColumn(
+                "Location", options=locations if locations else None, required=True
+            ) if locations else st.column_config.TextColumn("Location", required=True),
+            **{day: st.column_config.CheckboxColumn(day, default=True) for day in WEEKDAY_COLUMNS}
+        }
+    )
+    st.session_state['location_operating_days'] = df_to_operating_days(days_edited_df)
+
+    st.divider()
+    st.markdown("**Google Sheet sync** (uses a second tab, \"Operating Days\", in the same sheet as your quota overrides)")
+    col_e, col_f = st.columns(2)
+    with col_e:
+        if st.button("⬇️ Load from Google Sheet", key="load_days_btn"):
+            if not st.session_state.get('overrides_sheet_url'):
+                st.error("Enter a Google Sheet URL or ID in the Location Quota Overrides section first.")
+            else:
+                try:
+                    st.session_state['location_operating_days'] = load_operating_days_from_sheet(
+                        st.session_state['overrides_sheet_url']
+                    )
+                    st.success("Loaded operating days from the Google Sheet.")
+                    st.rerun()
+                except gspread.exceptions.SpreadsheetNotFound:
+                    st.error(
+                        "Sheet not found. Check the URL/ID and make sure it's "
+                        "shared with the service account's client_email."
+                    )
+                except gspread.exceptions.APIError as e:
+                    st.error(f"Google Sheets API error: {e}")
+                except KeyError:
+                    st.error(
+                        "No 'gcp_service_account' credentials found in "
+                        "st.secrets — add your service account JSON there first."
+                    )
+    with col_f:
+        if st.button("⬆️ Save to Google Sheet", key="save_days_btn"):
+            if not st.session_state.get('overrides_sheet_url'):
+                st.error("Enter a Google Sheet URL or ID in the Location Quota Overrides section first.")
+            else:
+                try:
+                    save_operating_days_to_sheet(
+                        st.session_state['location_operating_days'],
+                        st.session_state['overrides_sheet_url']
+                    )
+                    st.success("Saved operating days to the Google Sheet.")
+                except gspread.exceptions.SpreadsheetNotFound:
+                    st.error(
+                        "Sheet not found. Check the URL/ID and make sure it's "
+                        "shared with the service account's client_email."
+                    )
+                except gspread.exceptions.APIError as e:
+                    st.error(f"Google Sheets API error: {e}")
+                except KeyError:
+                    st.error(
+                        "No 'gcp_service_account' credentials found in "
+                        "st.secrets — add your service account JSON there first."
+                    )
+
+    with st.expander("Backup as a local file instead"):
+        col_g, col_h = st.columns(2)
+        with col_g:
+            st.download_button(
+                "Save operating days to file",
+                data=json.dumps(
+                    {loc: sorted(days) for loc, days in st.session_state['location_operating_days'].items()},
+                    indent=2
+                ),
+                file_name="location_operating_days.json",
+                mime="application/json"
+            )
+        with col_h:
+            uploaded_days = st.file_uploader(
+                "Load operating days from file", type=["json"], key="operating_days_uploader"
+            )
+            if uploaded_days is not None:
+                try:
+                    raw = json.load(uploaded_days)
+                    st.session_state['location_operating_days'] = {
+                        loc: set(days) for loc, days in raw.items()
+                    }
+                    st.success("Operating days loaded. Expand this section to review them.")
+                except (json.JSONDecodeError, ValueError, AttributeError):
+                    st.error("That file doesn't look like a valid operating-days JSON export.")
+
 if st.button("Run Report"):
     if not api_key:
         st.error("API Key is required!")
@@ -328,7 +864,11 @@ if st.button("Run Report"):
         if df_raw.empty:
             st.warning("No submissions found for this selection.")
         else:
-            compliance_summary = compute_period_targets(df_raw, start_date, end_date, selected_forms, selected_locations)
+            compliance_summary = compute_period_targets(
+                df_raw, start_date, end_date, selected_forms, selected_locations,
+                overrides=st.session_state.get('location_overrides', LOCATION_COMPLIANCE_OVERRIDES),
+                operating_days=st.session_state.get('location_operating_days', LOCATION_OPERATING_DAYS)
+            )
             leaderboard = leaderboard_with_badges(compliance_summary)
 
             st.subheader("Compliance Summary")
