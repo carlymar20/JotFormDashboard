@@ -298,6 +298,72 @@ FORM_ID_TO_LOCATION_FIELDS = {
 # It is no longer used to decide which field's answer to actually pull.
 LOCATION_MATCH_WORD = "location"
 
+# The single source of truth for valid location names, from Carly's master
+# location list (exported from the sheet she maintains). This replaces
+# pulling location options from each individual form's dropdown definition —
+# we found different forms have DIFFERENT text for the same physical site
+# (e.g. Lot Audit's dropdown said "TX - Courtyard Residence Inn Austin DT"
+# while Daily Huddle's said "TX -  CY & RI Austin Downtown"), so per-form
+# scraping was never going to give one consistent list.
+#
+# To update: replace this list from a fresh export of the master sheet.
+MASTER_LOCATIONS = [
+    "FL - Hotel Flor Tampa", "CA - Beverly Hills Marriott", "CA - Cameo Beverly Hills",
+    "CA - Courtyard Santa Monica", "CA - Hampton Inn Santa Monica", "CA - Hilton Costa Mesa",
+    "CA - Hilton Garden Inn Dana Point", "CO - Grand Hyatt Denver", "Corporate",
+    "DC - Melrose Hotel", "DC - St. Regis Washington DC", "DC - The LINE DC",
+    "DC - Westin Downtown", "FL - 4th Street Lot", "FL - 830 Brickell",
+    "FL - 888 Brickell Dolce Gabanna", "FL - AC Hotel Clearwater Beach", "FL - AC Hotel St. Pete",
+    "FL - AC Orlando Downtown", "FL - Andaz Miami Beach", "FL - Bellini",
+    "FL - Courtyard Clearwater Beach", "FL - Courtyard Downtown St. Pete",
+    "FL - Courtyard Downtown Tampa", "FL - Fifth Third Bank Center", "FL - HCC Ybor City Shuttle",
+    "FL - Hilton St. Pete Bayfront", "FL - Hotel Haya Tampa", "FL - Hyatt House/Hyatt Place Tampa",
+    "FL - Jacksonville DoubleTree", "FL - Juno & The Peacock", "FL - JW Marriott Clearwater",
+    "FL - Kettler/Edge Lot", "FL - Miami Center 2", "FL - Mint House St. Pete",
+    "FL - OLIVIA St. Pete", "FL - Renaissance Tampa", "FL - Ritz Carlton Sarasota",
+    "FL - Rivergate Tower Tampa", "FL - Saddlebrook Resort", "FL - Sheraton Sand Key",
+    "FL - SkyBeach Resort St. Pete", "FL - St. Regis Long Boat Key",
+    "FL - The Vinoy Resort & Golf Club", "FL - Tru St. Pete Downtown", "FL - Westin Sarasota",
+    "FL - Westin Tampa Waterside", "FL - Wynwood Plaza", "GA - Aloft Savannah",
+    "GA - Fairfield Inn Savannah", "GA - Hampton Inn Savannah", "GA - HGI/HWS Atlanta Midtown",
+    "GA - Holiday Inn Express Savannah", "GA - Ritz Carlton Atlanta", "GA - River Street Inn",
+    "GA - SpringHill Atlanta", "GA - Studio Homes", "GA - Tempo Savannah",
+    "GA - The Desoto Savannah", "GA - The Douglas Savannah", "GA - The Georgian Terrace",
+    "GA - The Tess Atlanta", "IL - Waldorf Astoria Chicago", "KY - Cincinnati Marriott at RiverCenter",
+    "LA - Ballys Hotel Casino", "LA - Cambria Hotel NOLA", "LA - Homewood NOLA",
+    "LA - Hotel Tonnelle NOLA", "LA - Le Pavillon New Orleans", "LA - Mercantile Hotel",
+    "LA - Ochsner Medical", "LA - Pontchartrain Hotel", "LA - Queen Baton Rouge",
+    "LA - Virgin NOLA", "NC - Tempo/HWS Raleigh", "OH - Hotel Celare", "OH - The Summit Hotel",
+    "Other", "SC - The Cooper Charleston", "TX -  CY RI Austin Downtown", "TX - Artisan Circle",
+    "TX - DoubleTree Houston", "TX - Hotel Daphne Houston", "TX - Hotel Saint Augustine Houston",
+    "TX - Intercontinental Houston Medical",
+]
+
+# Known non-canonical spellings found in actual submission/dropdown data
+# that should be folded into the master list's name instead of counted as
+# a separate location. Add to this as new mismatches turn up — same
+# pattern as FORM_ID_TO_LOCATION_FIELDS: explicit, human-verified entries,
+# no fuzzy-matching heuristics that could silently merge the wrong sites.
+#
+# This does NOT edit anything in JotForm or rewrite past submissions —
+# it just normalizes the text at report time, so reports are accurate
+# regardless of which spelling a given submission happened to use.
+LOCATION_ALIASES = {
+    "TX -  CY & RI Austin Downtown": "TX -  CY RI Austin Downtown",
+    "TX - Courtyard Residence Inn Austin DT": "TX -  CY RI Austin Downtown",
+}
+
+
+def normalize_location(raw_value):
+    """Map a raw submitted location string to its canonical master-list
+    name, if a known alias applies. Falls back to the trimmed original
+    value when there's no known alias (so unmapped/new locations still
+    show up rather than silently vanishing)."""
+    if raw_value is None:
+        return None
+    cleaned = raw_value.strip()
+    return LOCATION_ALIASES.get(cleaned, cleaned)
+
 
 def get_form_questions(form_id, api_key):
     """Fetch a form's field/question definitions (not submissions).
@@ -428,7 +494,8 @@ def extract_row(sub, form_id):
     for field_name in FORM_ID_TO_LOCATION_FIELDS.get(form_id, []):
         val = by_name.get(field_name)
         if val not in (None, ''):
-            row['location'] = val if isinstance(val, str) else str(val)
+            val = val if isinstance(val, str) else str(val)
+            row['location'] = normalize_location(val)
             break
 
     return row
@@ -585,43 +652,35 @@ selected_forms = st.multiselect("Select form(s):", options=form_names, default=f
 start_date = st.date_input("Start date")
 end_date = st.date_input("End date")
 
-# For the location picker: pull the REAL dropdown options straight from
-# each form's field setup, not from what people have actually submitted.
-# This avoids picking up write-in/free-text values that don't match the
-# official list of site names.
-if st.button("Load Locations"):
-    if not api_key:
-        st.error("API Key is required!")
-    else:
-        all_options = set()
-        for form_id in [FORM_NAME_TO_ID[n] for n in selected_forms]:
-            opts = get_location_options_for_form(form_id, api_key)
-            if not opts:
-                st.warning(
-                    f"Could not find dropdown location options for "
-                    f"'{FORM_ID_TO_NAME[form_id]}' — check its confirmed "
-                    f"field name(s) in FORM_ID_TO_LOCATION_FIELDS."
-                )
-            all_options.update(opts)
-        locations = sorted(all_options)
-        if not locations:
-            st.warning("No location options found for these forms.")
-        st.session_state['locations'] = locations
-        # Reset the selection to match the freshly loaded options. This must
-        # write directly to the multiselect's OWN widget key
-        # ('selected_locations_widget'), not a separate key — once a widget
-        # has a `key`, Streamlit ignores `default=` on every rerun after the
-        # first and just keeps whatever is stored under that key. Writing to
-        # a different key (as before) meant this reset silently never took
-        # effect, and the dropdown could stay stuck on an old selection.
-        st.session_state['selected_locations_widget'] = locations
+# Location options now come from MASTER_LOCATIONS (Carly's master site
+# list) rather than being scraped from each form's own dropdown setup.
+# We found different forms used different text for the same physical site
+# (e.g. "TX - Courtyard Residence Inn Austin DT" vs "TX -  CY & RI Austin
+# Downtown" for the same hotel), so per-form scraping could never produce
+# one consistent list. extract_row() normalizes submitted answers against
+# this same list via LOCATION_ALIASES, so submissions and filter options
+# always line up.
+if 'locations' not in st.session_state:
+    st.session_state['locations'] = sorted(MASTER_LOCATIONS)
 
-locations = st.session_state.get('locations', [])
+locations = st.session_state['locations']
 selected_locations = st.multiselect(
     "Select location(s):",
     options=locations,
+    default=locations,
     key='selected_locations_widget'
 )
+
+with st.expander("Location list options"):
+    st.caption(
+        "The location list above comes from the hardcoded MASTER_LOCATIONS "
+        "list in the code, not from JotForm. If the master list changes, "
+        "update MASTER_LOCATIONS with a fresh export."
+    )
+    if st.button("Reset to full master list"):
+        st.session_state['locations'] = sorted(MASTER_LOCATIONS)
+        st.session_state['selected_locations_widget'] = sorted(MASTER_LOCATIONS)
+        st.rerun()
 
 # ---- Location Quota Overrides editor ----
 # Seed session state from the hardcoded LOCATION_COMPLIANCE_OVERRIDES the
