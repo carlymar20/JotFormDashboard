@@ -641,6 +641,35 @@ def leaderboard_with_badges(compliance_summary):
 
 st.title("JotForm Compliance Dashboard")
 
+# ---- Blend "admin" sections into the background ----
+# This targets EVERY st.expander on the page by its Streamlit testid, so it
+# covers the Location list options, Location Quota Overrides, Location
+# Operating Days, AND Debug Tools sections all at once — they all shrink
+# down and go white-on-white so they don't draw attention during normal
+# use, but stay fully clickable if you know where they are. NOTE: the
+# color below (#ffffff) matches Streamlit's default light-theme
+# background — if your app uses a dark theme or a custom background
+# color, change the hex codes below to match, or these sections will be
+# clearly visible instead of blended in.
+st.markdown(
+    """
+    <style>
+    [data-testid="stExpander"] {
+        font-size: 0.65rem;
+    }
+    [data-testid="stExpander"] summary,
+    [data-testid="stExpander"] summary * {
+        color: #ffffff !important;
+    }
+    [data-testid="stExpander"] * {
+        color: #ffffff !important;
+        font-size: 0.65rem !important;
+    }
+    </style>
+    """,
+    unsafe_allow_html=True
+)
+
 # Load API key from secrets (set after deploying to Streamlit Cloud)
 api_key = st.secrets["API_KEY"] if "API_KEY" in st.secrets else st.text_input("Enter your JotForm API Key:", type="password")
 
@@ -960,30 +989,6 @@ for _ in range(15):
     st.write("")
 
 # ---- Debug tools ----
-# Styled to be small and blend into the background so it doesn't draw
-# attention during normal use, but still fully clickable if you know it's
-# there. NOTE: the color below (#ffffff) matches Streamlit's default
-# light-theme background — if your app uses a dark theme or a custom
-# background color, change the hex codes below to match.
-st.markdown(
-    """
-    <style>
-    [data-testid="stExpander"] {
-        font-size: 0.65rem;
-    }
-    [data-testid="stExpander"] summary,
-    [data-testid="stExpander"] summary * {
-        color: #ffffff !important;
-    }
-    [data-testid="stExpander"] * {
-        color: #ffffff !important;
-        font-size: 0.65rem !important;
-    }
-    </style>
-    """,
-    unsafe_allow_html=True
-)
-
 with st.expander("🔧 Debug Tools (click to expand)", expanded=False):
     if st.button("Debug Field Names"):
         if not api_key:
@@ -992,10 +997,24 @@ with st.expander("🔧 Debug Tools (click to expand)", expanded=False):
             for form_id in [FORM_NAME_TO_ID[n] for n in selected_forms]:
                 subs = get_submissions(form_id, api_key, start_date, end_date)
                 st.write(f"### {FORM_ID_TO_NAME[form_id]}")
+                st.write(f"{len(subs)} submission(s) returned for this date range.")
                 if subs:
-                    st.write({v['name']: v.get('text') for v in subs[0]['answers'].values()})
+                    first = subs[0]
+                    st.write(
+                        f"Newest submission shown below — ID {first.get('id')}, "
+                        f"submitted {first.get('created_at')}"
+                    )
+                    st.write({
+                        v['name']: {'label': v.get('text'), 'answer': v.get('answer')}
+                        for v in first['answers'].values()
+                    })
+                    st.write(
+                        f"→ What extract_row() would record as location for this "
+                        f"submission: **{extract_row(first, form_id)['location']}**"
+                    )
                 else:
                     st.write("⚠️ No submissions returned at all for this form/date range")
+
 
     if st.button("Debug Location Field Setup"):
         if not api_key:
