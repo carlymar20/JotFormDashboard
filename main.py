@@ -3,6 +3,7 @@ import pandas as pd
 import requests
 import io
 import time
+import html
 import json
 import copy
 import gspread
@@ -358,10 +359,16 @@ def normalize_location(raw_value):
     """Map a raw submitted location string to its canonical master-list
     name, if a known alias applies. Falls back to the trimmed original
     value when there's no known alias (so unmapped/new locations still
-    show up rather than silently vanishing)."""
+    show up rather than silently vanishing).
+
+    Also decodes HTML entities (e.g. "&amp;" -> "&") — JotForm's raw API
+    answer text can come back HTML-encoded even when its own UI displays
+    the decoded version, which silently breaks exact-string matching
+    against the master list (found via "FL - The Vinoy Resort &amp; Golf
+    Club" failing to match "FL - The Vinoy Resort & Golf Club")."""
     if raw_value is None:
         return None
-    cleaned = raw_value.strip()
+    cleaned = html.unescape(raw_value.strip())
     return LOCATION_ALIASES.get(cleaned, cleaned)
 
 
