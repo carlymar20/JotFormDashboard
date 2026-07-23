@@ -990,6 +990,37 @@ for _ in range(15):
 
 # ---- Debug tools ----
 with st.expander("🔧 Debug Tools (click to expand)", expanded=False):
+    if st.button("Debug: Location Match Check (for current form/date selection)"):
+        if not api_key:
+            st.error("API Key is required!")
+        else:
+            st.caption(
+                "This shows every DISTINCT location value extract_row() actually "
+                "produces for the selected forms/date range, ignoring the location "
+                "filter — so we can catch near-invisible mismatches (stray spaces, "
+                "lookalike dash characters, etc.) that make a real submission fail "
+                "to match your selected location(s) exactly."
+            )
+            for form_id in [FORM_NAME_TO_ID[n] for n in selected_forms]:
+                subs = get_submissions(form_id, api_key, start_date, end_date)
+                st.write(f"### {FORM_ID_TO_NAME[form_id]} — {len(subs)} submission(s)")
+                if not subs:
+                    st.write("⚠️ No submissions returned at all for this form/date range")
+                    continue
+                extracted = [extract_row(s, form_id)['location'] for s in subs]
+                counts = pd.Series(extracted).value_counts(dropna=False)
+                rows = []
+                for loc_val, count in counts.items():
+                    display_val = loc_val if loc_val is not None else "(blank/None)"
+                    exact_match = (loc_val in MASTER_LOCATIONS) if loc_val else False
+                    rows.append({
+                        "extracted_location": display_val,
+                        "repr (shows hidden chars)": repr(loc_val),
+                        "count": count,
+                        "exact_match_to_master_list": exact_match,
+                    })
+                st.dataframe(pd.DataFrame(rows))
+
     if st.button("Debug Field Names"):
         if not api_key:
             st.error("API Key is required!")
