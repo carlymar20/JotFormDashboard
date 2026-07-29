@@ -292,6 +292,7 @@ FORM_ID_TO_LOCATION_FIELDS = {
     "230404704539149": ["location", "location39"],    # Overnight Valet
     "233176683727163": ["location"],                  # Parking/Work Area Hazard
     "222195371011142": ["location74", "location"],    # Site Audit
+    "262024177345151": ["location172", "location"],   # NEW Valet Driver Assessment
 }
 
 # Kept for the diagnostic "Debug Location Field Setup" button below, which
