@@ -913,6 +913,69 @@ st.markdown(
 api_key = st.secrets["API_KEY"] if "API_KEY" in st.secrets \
     else st.text_input("Enter your JotForm API Key:", type="password")
 
+# ---------------------------------------------------------------------------
+# Admin gate
+# ---------------------------------------------------------------------------
+# Hides the Location list, Quota Overrides, Operating Days and Debug Tools
+# sections from everyone except whoever knows the admin password.
+#
+# Set the password in Streamlit secrets:
+#     ADMIN_PASSWORD = "something-only-you-know"
+#
+# HONEST LIMITS OF THIS: it keeps the settings out of reach of people using
+# the dashboard normally, which is the actual goal. It is NOT a security
+# boundary against someone determined — anyone who can open the app is still
+# talking to the same server, and the underlying Google Sheet is protected by
+# its own sharing settings, not by this. For real access control, restrict who
+# can open the app at all via Streamlit Cloud's viewer settings.
+#
+# If ADMIN_PASSWORD isn't set, the app falls back to unlocking with ?admin=1
+# on the end of the URL — convenient, but anyone who sees you do it can repeat
+# it, so set the password once you're past testing.
+ADMIN_PASSWORD = st.secrets.get("ADMIN_PASSWORD", "")
+
+
+def _get_query_params():
+    """st.query_params on modern Streamlit, experimental_get_query_params on
+    older builds. Returns a plain dict of str -> str."""
+    try:
+        return {k: (v[0] if isinstance(v, list) else v) for k, v in st.query_params.items()}
+    except Exception:
+        try:
+            return {k: (v[0] if isinstance(v, list) else v)
+                    for k, v in st.experimental_get_query_params().items()}
+        except Exception:
+            return {}
+
+
+if 'is_admin' not in st.session_state:
+    st.session_state['is_admin'] = (
+        not ADMIN_PASSWORD and str(_get_query_params().get("admin", "")) == "1"
+    )
+
+with st.sidebar:
+    st.markdown("### Admin")
+    if st.session_state['is_admin']:
+        st.success("Admin tools unlocked")
+        if st.button("Lock admin tools"):
+            st.session_state['is_admin'] = False
+            st.rerun()
+    elif ADMIN_PASSWORD:
+        _pw = st.text_input("Admin password", type="password", key="admin_pw")
+        if st.button("Unlock"):
+            if _pw == ADMIN_PASSWORD:
+                st.session_state['is_admin'] = True
+                st.rerun()
+            else:
+                st.error("Incorrect password.")
+    else:
+        st.caption(
+            "No ADMIN_PASSWORD is set in secrets, so admin tools unlock with "
+            "`?admin=1` on the end of the URL. Set a password to lock them properly."
+        )
+
+is_admin = st.session_state['is_admin']
+
 # The sheet URL/ID defaults to st.secrets["overrides_sheet_url"] if set, so
 # nobody has to re-paste it every session.
 if 'overrides_sheet_url' not in st.session_state:
@@ -1003,259 +1066,266 @@ with col_s2:
         st.session_state['selected_locations_widget'] = []
         st.rerun()
 
-for msg in st.session_state.get('sheet_messages', []):
-    st.info(msg, icon="ℹ️")
+# Sheet-loading diagnostics (blank quotas, unlabelled columns, fallback list
+# in use) are configuration problems, not something a normal viewer can act
+# on — so they're admin-only too.
+if is_admin:
+    for msg in st.session_state.get('sheet_messages', []):
+        st.info(msg, icon="ℹ️")
 
-# ---- Location list editor ----
-with st.expander("📍 Location list", expanded=False):
-    st.caption(
-        f"Currently loaded from **{st.session_state.get('locations_source')}** — "
-        f"{len(locations)} locations. Add or edit rows below, then click "
-        f"**Save to Google Sheet** so the change sticks for everyone. You can "
-        f"also edit the \"{LOCATIONS_TAB}\" tab directly in Google Sheets."
-    )
+if is_admin:
+    # ---- Location list editor ----
+    with st.expander("📍 Location list", expanded=False):
+        st.caption(
+            f"Currently loaded from **{st.session_state.get('locations_source')}** — "
+            f"{len(locations)} locations. Add or edit rows below, then click "
+            f"**Save to Google Sheet** so the change sticks for everyone. You can "
+            f"also edit the \"{LOCATIONS_TAB}\" tab directly in Google Sheets."
+        )
 
-    loc_edited_df = st.data_editor(
-        pd.DataFrame({"Location": locations}),
-        num_rows="dynamic",
-        key="locations_editor",
-        column_config={"Location": st.column_config.TextColumn("Location", required=True)},
-        **FILL,
-    )
-    _edited, _seen = [], set()
-    for v in loc_edited_df["Location"].tolist():
-        if v is None:
-            continue
-        c = html.unescape(str(v).strip())
-        if c and c not in _seen:
-            _seen.add(c)
-            _edited.append(c)
+        loc_edited_df = st.data_editor(
+            pd.DataFrame({"Location": locations}),
+            num_rows="dynamic",
+            key="locations_editor",
+            column_config={"Location": st.column_config.TextColumn("Location", required=True)},
+            **FILL,
+        )
+        _edited, _seen = [], set()
+        for v in loc_edited_df["Location"].tolist():
+            if v is None:
+                continue
+            c = html.unescape(str(v).strip())
+            if c and c not in _seen:
+                _seen.add(c)
+                _edited.append(c)
 
-    lc1, lc2, lc3 = st.columns(3)
-    with lc1:
-        if st.button("⬆️ Save to Google Sheet", key="save_locs_btn"):
-            if not st.session_state.get('overrides_sheet_url'):
-                st.error("Enter a Google Sheet URL or ID in the Quota Overrides section first.")
-            else:
-                try:
-                    save_locations_to_sheet(_edited, st.session_state['overrides_sheet_url'])
-                    st.session_state['locations'] = _edited
-                    st.session_state['locations_source'] = f"Google Sheet → {LOCATIONS_TAB} tab"
-                    st.session_state['_reload_location_widget'] = True
-                    st.success(f"Saved {len(_edited)} locations.")
-                    st.rerun()
-                except gspread.exceptions.SpreadsheetNotFound:
-                    st.error("Sheet not found. Check the URL/ID and that it's shared with the service account.")
-                except gspread.exceptions.APIError as e:
-                    st.error(f"Google Sheets API error: {e}")
-                except KeyError:
-                    st.error("No 'gcp_service_account' credentials found in st.secrets.")
-    with lc2:
-        if st.button("⬇️ Reload from Google Sheet", key="load_locs_btn"):
-            if not st.session_state.get('overrides_sheet_url'):
-                st.error("Enter a Google Sheet URL or ID in the Quota Overrides section first.")
-            else:
-                try:
-                    fetched = load_locations_from_sheet(st.session_state['overrides_sheet_url'])
-                    if fetched:
-                        st.session_state['locations'] = fetched
+        lc1, lc2, lc3 = st.columns(3)
+        with lc1:
+            if st.button("⬆️ Save to Google Sheet", key="save_locs_btn"):
+                if not st.session_state.get('overrides_sheet_url'):
+                    st.error("Enter a Google Sheet URL or ID in the Quota Overrides section first.")
+                else:
+                    try:
+                        save_locations_to_sheet(_edited, st.session_state['overrides_sheet_url'])
+                        st.session_state['locations'] = _edited
                         st.session_state['locations_source'] = f"Google Sheet → {LOCATIONS_TAB} tab"
                         st.session_state['_reload_location_widget'] = True
+                        st.success(f"Saved {len(_edited)} locations.")
                         st.rerun()
-                    else:
-                        st.warning(f"The \"{LOCATIONS_TAB}\" tab is empty — nothing to load.")
-                except gspread.exceptions.APIError as e:
-                    st.error(f"Google Sheets API error: {e}")
-    with lc3:
-        if st.button("↩️ Reset to built-in list", key="reset_locs_btn"):
-            st.session_state['locations'] = sorted(MASTER_LOCATIONS)
-            st.session_state['locations_source'] = "built-in fallback list"
-            st.session_state['_reload_location_widget'] = True
-            st.rerun()
+                    except gspread.exceptions.SpreadsheetNotFound:
+                        st.error("Sheet not found. Check the URL/ID and that it's shared with the service account.")
+                    except gspread.exceptions.APIError as e:
+                        st.error(f"Google Sheets API error: {e}")
+                    except KeyError:
+                        st.error("No 'gcp_service_account' credentials found in st.secrets.")
+        with lc2:
+            if st.button("⬇️ Reload from Google Sheet", key="load_locs_btn"):
+                if not st.session_state.get('overrides_sheet_url'):
+                    st.error("Enter a Google Sheet URL or ID in the Quota Overrides section first.")
+                else:
+                    try:
+                        fetched = load_locations_from_sheet(st.session_state['overrides_sheet_url'])
+                        if fetched:
+                            st.session_state['locations'] = fetched
+                            st.session_state['locations_source'] = f"Google Sheet → {LOCATIONS_TAB} tab"
+                            st.session_state['_reload_location_widget'] = True
+                            st.rerun()
+                        else:
+                            st.warning(f"The \"{LOCATIONS_TAB}\" tab is empty — nothing to load.")
+                    except gspread.exceptions.APIError as e:
+                        st.error(f"Google Sheets API error: {e}")
+        with lc3:
+            if st.button("↩️ Reset to built-in list", key="reset_locs_btn"):
+                st.session_state['locations'] = sorted(MASTER_LOCATIONS)
+                st.session_state['locations_source'] = "built-in fallback list"
+                st.session_state['_reload_location_widget'] = True
+                st.rerun()
 
 compliance_form_names = [f for f in FORM_NAME_TO_ID if FORM_COMPLIANCE.get(f)]
 
-# ---- Location Quota Overrides editor ----
-with st.expander("⚙️ Location Quota Overrides", expanded=False):
-    st.caption(
-        "Set a different quota (and, if needed, a different interval) for "
-        "specific locations. Any location not listed here uses the form's "
-        "standard quota. **Leave Quota blank and the row is ignored** — enter "
-        "0 to mean 'this location doesn't have to do this form at all'."
-    )
+if is_admin:
+    # ---- Location Quota Overrides editor ----
+    with st.expander("⚙️ Location Quota Overrides", expanded=False):
+        st.caption(
+            "Set a different quota (and, if needed, a different interval) for "
+            "specific locations. Any location not listed here uses the form's "
+            "standard quota. **Leave Quota blank and the row is ignored** — enter "
+            "0 to mean 'this location doesn't have to do this form at all'."
+        )
 
-    edited_df = st.data_editor(
-        overrides_to_df(st.session_state['location_overrides']),
-        num_rows="dynamic",
-        key="overrides_editor",
-        column_config={
-            "Form": st.column_config.SelectboxColumn("Form", options=compliance_form_names, required=True),
-            "Location": st.column_config.SelectboxColumn(
-                "Location", options=locations, required=True
-            ) if locations else st.column_config.TextColumn("Location", required=True),
-            "Quota": st.column_config.NumberColumn("Quota", min_value=0, step=1),
-            "Interval": st.column_config.SelectboxColumn(
-                "Interval", options=["daily", "weekly", "monthly"]
-            ),
-        },
-        **FILL,
-    )
-    _ovr, _skipped = df_to_overrides(edited_df, collect_skipped=True)
-    st.session_state['location_overrides'] = _ovr
-    for msg in _skipped:
-        st.warning(msg)
-
-    st.divider()
-    st.markdown("**Google Sheet sync** (persists across sessions and app restarts)")
-    st.session_state['overrides_sheet_url'] = st.text_input(
-        "Google Sheet URL or ID",
-        value=st.session_state['overrides_sheet_url'],
-        help="The sheet must be shared (Editor access) with your service account's "
-             "email — found as 'client_email' in st.secrets['gcp_service_account'].",
-    )
-
-    col_a, col_b = st.columns(2)
-    with col_a:
-        if st.button("⬇️ Load from Google Sheet", key="load_ovr_btn"):
-            if not st.session_state['overrides_sheet_url']:
-                st.error("Enter a Google Sheet URL or ID first.")
-            else:
-                try:
-                    _ovr, _warn = load_overrides_from_sheet(st.session_state['overrides_sheet_url'])
-                    st.session_state['location_overrides'] = _ovr
-                    st.session_state['sheet_messages'] = _warn
-                    st.success("Loaded overrides from the Google Sheet.")
-                    st.rerun()
-                except gspread.exceptions.SpreadsheetNotFound:
-                    st.error("Sheet not found. Check the URL/ID and that it's shared with the service account.")
-                except gspread.exceptions.APIError as e:
-                    st.error(f"Google Sheets API error: {e}")
-                except KeyError:
-                    st.error("No 'gcp_service_account' credentials found in st.secrets.")
-    with col_b:
-        if st.button("⬆️ Save to Google Sheet", key="save_ovr_btn"):
-            if not st.session_state['overrides_sheet_url']:
-                st.error("Enter a Google Sheet URL or ID first.")
-            else:
-                try:
-                    save_overrides_to_sheet(
-                        st.session_state['location_overrides'],
-                        st.session_state['overrides_sheet_url'],
-                    )
-                    st.success("Saved overrides to the Google Sheet.")
-                except gspread.exceptions.SpreadsheetNotFound:
-                    st.error("Sheet not found. Check the URL/ID and that it's shared with the service account.")
-                except gspread.exceptions.APIError as e:
-                    st.error(f"Google Sheets API error: {e}")
-                except KeyError:
-                    st.error("No 'gcp_service_account' credentials found in st.secrets.")
-
-    with st.expander("Backup as a local file instead"):
-        col_c, col_d = st.columns(2)
-        with col_c:
-            st.download_button(
-                "Save overrides to file",
-                data=json.dumps(st.session_state['location_overrides'], indent=2),
-                file_name="location_quota_overrides.json",
-                mime="application/json",
-            )
-        with col_d:
-            uploaded_overrides = st.file_uploader(
-                "Load overrides from file", type=["json"], key="overrides_uploader"
-            )
-            if uploaded_overrides is not None:
-                try:
-                    st.session_state['location_overrides'] = json.load(uploaded_overrides)
-                    st.success("Overrides loaded. Expand this section to review them.")
-                except (json.JSONDecodeError, ValueError):
-                    st.error("That file doesn't look like a valid overrides JSON export.")
-
-# ---- Location Operating Days editor ----
-with st.expander("📅 Location Operating Days (5/6-day locations)", expanded=False):
-    st.caption(
-        "Only add a location here if it's NOT open all 7 days a week. Check the "
-        "days it IS open (e.g. Mon–Fri checked, Sat/Sun unchecked for a 5-day "
-        "site). Locations left off this list are assumed open every day. This "
-        "only affects daily-quota forms — weekly and monthly quotas are unchanged."
-    )
-
-    days_edited_df = st.data_editor(
-        operating_days_to_df(st.session_state['location_operating_days']),
-        num_rows="dynamic",
-        key="operating_days_editor",
-        column_config={
-            "Location": st.column_config.SelectboxColumn(
-                "Location", options=locations, required=True
-            ) if locations else st.column_config.TextColumn("Location", required=True),
-            **{day: st.column_config.CheckboxColumn(day, default=True) for day in WEEKDAY_COLUMNS},
-        },
-        **FILL,
-    )
-    st.session_state['location_operating_days'] = df_to_operating_days(days_edited_df)
-
-    st.divider()
-    st.markdown(f"**Google Sheet sync** (uses the \"{OPERATING_DAYS_TAB}\" tab in the same sheet)")
-    col_e, col_f = st.columns(2)
-    with col_e:
-        if st.button("⬇️ Load from Google Sheet", key="load_days_btn"):
-            if not st.session_state.get('overrides_sheet_url'):
-                st.error("Enter a Google Sheet URL or ID in the Quota Overrides section first.")
-            else:
-                try:
-                    st.session_state['location_operating_days'] = load_operating_days_from_sheet(
-                        st.session_state['overrides_sheet_url']
-                    )
-                    st.success("Loaded operating days from the Google Sheet.")
-                    st.rerun()
-                except gspread.exceptions.SpreadsheetNotFound:
-                    st.error("Sheet not found. Check the URL/ID and that it's shared with the service account.")
-                except gspread.exceptions.APIError as e:
-                    st.error(f"Google Sheets API error: {e}")
-                except KeyError:
-                    st.error("No 'gcp_service_account' credentials found in st.secrets.")
-    with col_f:
-        if st.button("⬆️ Save to Google Sheet", key="save_days_btn"):
-            if not st.session_state.get('overrides_sheet_url'):
-                st.error("Enter a Google Sheet URL or ID in the Quota Overrides section first.")
-            else:
-                try:
-                    save_operating_days_to_sheet(
-                        st.session_state['location_operating_days'],
-                        st.session_state['overrides_sheet_url'],
-                    )
-                    st.success("Saved operating days to the Google Sheet.")
-                except gspread.exceptions.SpreadsheetNotFound:
-                    st.error("Sheet not found. Check the URL/ID and that it's shared with the service account.")
-                except gspread.exceptions.APIError as e:
-                    st.error(f"Google Sheets API error: {e}")
-                except KeyError:
-                    st.error("No 'gcp_service_account' credentials found in st.secrets.")
-
-    with st.expander("Backup as a local file instead"):
-        col_g, col_h = st.columns(2)
-        with col_g:
-            st.download_button(
-                "Save operating days to file",
-                data=json.dumps(
-                    {loc: sorted(days) for loc, days in st.session_state['location_operating_days'].items()},
-                    indent=2,
+        edited_df = st.data_editor(
+            overrides_to_df(st.session_state['location_overrides']),
+            num_rows="dynamic",
+            key="overrides_editor",
+            column_config={
+                "Form": st.column_config.SelectboxColumn("Form", options=compliance_form_names, required=True),
+                "Location": st.column_config.SelectboxColumn(
+                    "Location", options=locations, required=True
+                ) if locations else st.column_config.TextColumn("Location", required=True),
+                "Quota": st.column_config.NumberColumn("Quota", min_value=0, step=1),
+                "Interval": st.column_config.SelectboxColumn(
+                    "Interval", options=["daily", "weekly", "monthly"]
                 ),
-                file_name="location_operating_days.json",
-                mime="application/json",
-            )
-        with col_h:
-            uploaded_days = st.file_uploader(
-                "Load operating days from file", type=["json"], key="operating_days_uploader"
-            )
-            if uploaded_days is not None:
-                try:
-                    raw = json.load(uploaded_days)
-                    st.session_state['location_operating_days'] = {
-                        loc: set(days) for loc, days in raw.items()
-                    }
-                    st.success("Operating days loaded. Expand this section to review them.")
-                except (json.JSONDecodeError, ValueError, AttributeError):
-                    st.error("That file doesn't look like a valid operating-days JSON export.")
+            },
+            **FILL,
+        )
+        _ovr, _skipped = df_to_overrides(edited_df, collect_skipped=True)
+        st.session_state['location_overrides'] = _ovr
+        for msg in _skipped:
+            st.warning(msg)
+
+        st.divider()
+        st.markdown("**Google Sheet sync** (persists across sessions and app restarts)")
+        st.session_state['overrides_sheet_url'] = st.text_input(
+            "Google Sheet URL or ID",
+            value=st.session_state['overrides_sheet_url'],
+            help="The sheet must be shared (Editor access) with your service account's "
+                 "email — found as 'client_email' in st.secrets['gcp_service_account'].",
+        )
+
+        col_a, col_b = st.columns(2)
+        with col_a:
+            if st.button("⬇️ Load from Google Sheet", key="load_ovr_btn"):
+                if not st.session_state['overrides_sheet_url']:
+                    st.error("Enter a Google Sheet URL or ID first.")
+                else:
+                    try:
+                        _ovr, _warn = load_overrides_from_sheet(st.session_state['overrides_sheet_url'])
+                        st.session_state['location_overrides'] = _ovr
+                        st.session_state['sheet_messages'] = _warn
+                        st.success("Loaded overrides from the Google Sheet.")
+                        st.rerun()
+                    except gspread.exceptions.SpreadsheetNotFound:
+                        st.error("Sheet not found. Check the URL/ID and that it's shared with the service account.")
+                    except gspread.exceptions.APIError as e:
+                        st.error(f"Google Sheets API error: {e}")
+                    except KeyError:
+                        st.error("No 'gcp_service_account' credentials found in st.secrets.")
+        with col_b:
+            if st.button("⬆️ Save to Google Sheet", key="save_ovr_btn"):
+                if not st.session_state['overrides_sheet_url']:
+                    st.error("Enter a Google Sheet URL or ID first.")
+                else:
+                    try:
+                        save_overrides_to_sheet(
+                            st.session_state['location_overrides'],
+                            st.session_state['overrides_sheet_url'],
+                        )
+                        st.success("Saved overrides to the Google Sheet.")
+                    except gspread.exceptions.SpreadsheetNotFound:
+                        st.error("Sheet not found. Check the URL/ID and that it's shared with the service account.")
+                    except gspread.exceptions.APIError as e:
+                        st.error(f"Google Sheets API error: {e}")
+                    except KeyError:
+                        st.error("No 'gcp_service_account' credentials found in st.secrets.")
+
+        with st.expander("Backup as a local file instead"):
+            col_c, col_d = st.columns(2)
+            with col_c:
+                st.download_button(
+                    "Save overrides to file",
+                    data=json.dumps(st.session_state['location_overrides'], indent=2),
+                    file_name="location_quota_overrides.json",
+                    mime="application/json",
+                )
+            with col_d:
+                uploaded_overrides = st.file_uploader(
+                    "Load overrides from file", type=["json"], key="overrides_uploader"
+                )
+                if uploaded_overrides is not None:
+                    try:
+                        st.session_state['location_overrides'] = json.load(uploaded_overrides)
+                        st.success("Overrides loaded. Expand this section to review them.")
+                    except (json.JSONDecodeError, ValueError):
+                        st.error("That file doesn't look like a valid overrides JSON export.")
+
+if is_admin:
+    # ---- Location Operating Days editor ----
+    with st.expander("📅 Location Operating Days (5/6-day locations)", expanded=False):
+        st.caption(
+            "Only add a location here if it's NOT open all 7 days a week. Check the "
+            "days it IS open (e.g. Mon–Fri checked, Sat/Sun unchecked for a 5-day "
+            "site). Locations left off this list are assumed open every day. This "
+            "only affects daily-quota forms — weekly and monthly quotas are unchanged."
+        )
+
+        days_edited_df = st.data_editor(
+            operating_days_to_df(st.session_state['location_operating_days']),
+            num_rows="dynamic",
+            key="operating_days_editor",
+            column_config={
+                "Location": st.column_config.SelectboxColumn(
+                    "Location", options=locations, required=True
+                ) if locations else st.column_config.TextColumn("Location", required=True),
+                **{day: st.column_config.CheckboxColumn(day, default=True) for day in WEEKDAY_COLUMNS},
+            },
+            **FILL,
+        )
+        st.session_state['location_operating_days'] = df_to_operating_days(days_edited_df)
+
+        st.divider()
+        st.markdown(f"**Google Sheet sync** (uses the \"{OPERATING_DAYS_TAB}\" tab in the same sheet)")
+        col_e, col_f = st.columns(2)
+        with col_e:
+            if st.button("⬇️ Load from Google Sheet", key="load_days_btn"):
+                if not st.session_state.get('overrides_sheet_url'):
+                    st.error("Enter a Google Sheet URL or ID in the Quota Overrides section first.")
+                else:
+                    try:
+                        st.session_state['location_operating_days'] = load_operating_days_from_sheet(
+                            st.session_state['overrides_sheet_url']
+                        )
+                        st.success("Loaded operating days from the Google Sheet.")
+                        st.rerun()
+                    except gspread.exceptions.SpreadsheetNotFound:
+                        st.error("Sheet not found. Check the URL/ID and that it's shared with the service account.")
+                    except gspread.exceptions.APIError as e:
+                        st.error(f"Google Sheets API error: {e}")
+                    except KeyError:
+                        st.error("No 'gcp_service_account' credentials found in st.secrets.")
+        with col_f:
+            if st.button("⬆️ Save to Google Sheet", key="save_days_btn"):
+                if not st.session_state.get('overrides_sheet_url'):
+                    st.error("Enter a Google Sheet URL or ID in the Quota Overrides section first.")
+                else:
+                    try:
+                        save_operating_days_to_sheet(
+                            st.session_state['location_operating_days'],
+                            st.session_state['overrides_sheet_url'],
+                        )
+                        st.success("Saved operating days to the Google Sheet.")
+                    except gspread.exceptions.SpreadsheetNotFound:
+                        st.error("Sheet not found. Check the URL/ID and that it's shared with the service account.")
+                    except gspread.exceptions.APIError as e:
+                        st.error(f"Google Sheets API error: {e}")
+                    except KeyError:
+                        st.error("No 'gcp_service_account' credentials found in st.secrets.")
+
+        with st.expander("Backup as a local file instead"):
+            col_g, col_h = st.columns(2)
+            with col_g:
+                st.download_button(
+                    "Save operating days to file",
+                    data=json.dumps(
+                        {loc: sorted(days) for loc, days in st.session_state['location_operating_days'].items()},
+                        indent=2,
+                    ),
+                    file_name="location_operating_days.json",
+                    mime="application/json",
+                )
+            with col_h:
+                uploaded_days = st.file_uploader(
+                    "Load operating days from file", type=["json"], key="operating_days_uploader"
+                )
+                if uploaded_days is not None:
+                    try:
+                        raw = json.load(uploaded_days)
+                        st.session_state['location_operating_days'] = {
+                            loc: set(days) for loc, days in raw.items()
+                        }
+                        st.success("Operating days loaded. Expand this section to review them.")
+                    except (json.JSONDecodeError, ValueError, AttributeError):
+                        st.error("That file doesn't look like a valid operating-days JSON export.")
 
 # ---- Run Report ----
 if st.button("Run Report", type="primary"):
@@ -1338,95 +1408,96 @@ if st.button("Run Report", type="primary"):
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             )
 
-# ---- Debug tools ----
-st.write("")
-st.write("")
-with st.expander("🔧 Debug Tools", expanded=False):
-    if st.button("Debug: Location Match Check (for current form/date selection)"):
-        if not api_key:
-            st.error("API Key is required!")
-        else:
-            st.caption(
-                "Every DISTINCT location value extract_row() actually produces for "
-                "the selected forms/date range, ignoring the location filter — so "
-                "near-invisible mismatches (stray spaces, lookalike dashes) that "
-                "make a real submission fail to match are visible."
-            )
-            try:
-                for form_id in [FORM_NAME_TO_ID[n] for n in selected_forms]:
-                    subs = get_submissions(form_id, api_key, start_date, end_date)
-                    st.write(f"### {FORM_ID_TO_NAME[form_id]} — {len(subs)} submission(s)")
-                    if not subs:
-                        st.write("⚠️ No submissions returned at all for this form/date range")
-                        continue
-                    extracted = [extract_row(s, form_id)['location'] for s in subs]
-                    counts = pd.Series(extracted).value_counts(dropna=False)
-                    rows = []
-                    for loc_val, count in counts.items():
-                        rows.append({
-                            "extracted_location": loc_val if loc_val is not None else "(blank/None)",
-                            "repr (shows hidden chars)": repr(loc_val),
-                            "count": count,
-                            "in_current_location_list": (loc_val in locations) if loc_val else False,
-                        })
-                    st.dataframe(pd.DataFrame(rows), **FILL)
-            except JotFormError as e:
-                st.error(str(e))
+if is_admin:
+    # ---- Debug tools ----
+    st.write("")
+    st.write("")
+    with st.expander("🔧 Debug Tools", expanded=False):
+        if st.button("Debug: Location Match Check (for current form/date selection)"):
+            if not api_key:
+                st.error("API Key is required!")
+            else:
+                st.caption(
+                    "Every DISTINCT location value extract_row() actually produces for "
+                    "the selected forms/date range, ignoring the location filter — so "
+                    "near-invisible mismatches (stray spaces, lookalike dashes) that "
+                    "make a real submission fail to match are visible."
+                )
+                try:
+                    for form_id in [FORM_NAME_TO_ID[n] for n in selected_forms]:
+                        subs = get_submissions(form_id, api_key, start_date, end_date)
+                        st.write(f"### {FORM_ID_TO_NAME[form_id]} — {len(subs)} submission(s)")
+                        if not subs:
+                            st.write("⚠️ No submissions returned at all for this form/date range")
+                            continue
+                        extracted = [extract_row(s, form_id)['location'] for s in subs]
+                        counts = pd.Series(extracted).value_counts(dropna=False)
+                        rows = []
+                        for loc_val, count in counts.items():
+                            rows.append({
+                                "extracted_location": loc_val if loc_val is not None else "(blank/None)",
+                                "repr (shows hidden chars)": repr(loc_val),
+                                "count": count,
+                                "in_current_location_list": (loc_val in locations) if loc_val else False,
+                            })
+                        st.dataframe(pd.DataFrame(rows), **FILL)
+                except JotFormError as e:
+                    st.error(str(e))
 
-    if st.button("Debug Field Names"):
-        if not api_key:
-            st.error("API Key is required!")
-        else:
-            try:
-                for form_id in [FORM_NAME_TO_ID[n] for n in selected_forms]:
-                    subs = get_submissions(form_id, api_key, start_date, end_date)
-                    st.write(f"### {FORM_ID_TO_NAME[form_id]}")
-                    st.write(f"{len(subs)} submission(s) returned for this date range.")
-                    if subs:
-                        first = subs[0]
-                        st.write(
-                            f"Newest submission shown below — ID {first.get('id')}, "
-                            f"submitted {first.get('created_at')}"
-                        )
-                        st.write({
-                            v.get('name'): {'label': v.get('text'), 'answer': v.get('answer')}
-                            for v in first['answers'].values()
-                        })
-                        st.write(
-                            f"→ What extract_row() records as location for this "
-                            f"submission: **{extract_row(first, form_id)['location']}**"
-                        )
-                    else:
-                        st.write("⚠️ No submissions returned at all for this form/date range")
-            except JotFormError as e:
-                st.error(str(e))
+        if st.button("Debug Field Names"):
+            if not api_key:
+                st.error("API Key is required!")
+            else:
+                try:
+                    for form_id in [FORM_NAME_TO_ID[n] for n in selected_forms]:
+                        subs = get_submissions(form_id, api_key, start_date, end_date)
+                        st.write(f"### {FORM_ID_TO_NAME[form_id]}")
+                        st.write(f"{len(subs)} submission(s) returned for this date range.")
+                        if subs:
+                            first = subs[0]
+                            st.write(
+                                f"Newest submission shown below — ID {first.get('id')}, "
+                                f"submitted {first.get('created_at')}"
+                            )
+                            st.write({
+                                v.get('name'): {'label': v.get('text'), 'answer': v.get('answer')}
+                                for v in first['answers'].values()
+                            })
+                            st.write(
+                                f"→ What extract_row() records as location for this "
+                                f"submission: **{extract_row(first, form_id)['location']}**"
+                            )
+                        else:
+                            st.write("⚠️ No submissions returned at all for this form/date range")
+                except JotFormError as e:
+                    st.error(str(e))
 
-    if st.button("Debug Location Field Setup"):
-        if not api_key:
-            st.error("API Key is required!")
-        else:
-            try:
-                for form_id in [FORM_NAME_TO_ID[n] for n in selected_forms]:
-                    st.write(f"### {FORM_ID_TO_NAME[form_id]}")
-                    questions = get_form_questions(form_id, api_key)
-                    try:
-                        items = sorted(questions.items(), key=lambda kv: int(kv[0]))
-                    except (ValueError, TypeError):
-                        items = list(questions.items())
-                    candidates = [
-                        q for (k, q) in items
-                        if LOCATION_MATCH_WORD in str(q.get('name', '')).strip().lower()
-                        or LOCATION_MATCH_WORD in str(q.get('text', '')).strip().lower()
-                    ]
-                    if not candidates:
-                        st.write("⚠️ No fields mentioning 'location' found at all.")
-                        continue
-                    for q in candidates:
-                        st.write({
-                            'name': q.get('name'),
-                            'text (label)': q.get('text'),
-                            'type': q.get('type'),
-                            'options': q.get('options'),
-                        })
-            except JotFormError as e:
-                st.error(str(e))
+        if st.button("Debug Location Field Setup"):
+            if not api_key:
+                st.error("API Key is required!")
+            else:
+                try:
+                    for form_id in [FORM_NAME_TO_ID[n] for n in selected_forms]:
+                        st.write(f"### {FORM_ID_TO_NAME[form_id]}")
+                        questions = get_form_questions(form_id, api_key)
+                        try:
+                            items = sorted(questions.items(), key=lambda kv: int(kv[0]))
+                        except (ValueError, TypeError):
+                            items = list(questions.items())
+                        candidates = [
+                            q for (k, q) in items
+                            if LOCATION_MATCH_WORD in str(q.get('name', '')).strip().lower()
+                            or LOCATION_MATCH_WORD in str(q.get('text', '')).strip().lower()
+                        ]
+                        if not candidates:
+                            st.write("⚠️ No fields mentioning 'location' found at all.")
+                            continue
+                        for q in candidates:
+                            st.write({
+                                'name': q.get('name'),
+                                'text (label)': q.get('text'),
+                                'type': q.get('type'),
+                                'options': q.get('options'),
+                            })
+                except JotFormError as e:
+                    st.error(str(e))
