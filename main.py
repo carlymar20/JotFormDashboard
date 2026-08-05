@@ -24,6 +24,15 @@ try:
 except Exception:
     FILL = {"use_container_width": True}
 
+# Same idea for st.date_input's `format` argument, which only exists on
+# Streamlit 1.30+. On older builds we just leave it off rather than crash —
+# the picker falls back to YYYY/MM/DD, but everything still works.
+try:
+    DATE_FMT = {"format": "MM/DD/YYYY"} \
+        if "format" in inspect.signature(st.date_input).parameters else {}
+except Exception:
+    DATE_FMT = {}
+
 
 # -------- SETTINGS --------
 # NOTE ON THE HAZARD FORM: the Parking Area(s) & Workplace Hazard Inspection
@@ -588,6 +597,34 @@ def _date_answer(answer):
     return str(answer).strip() or None
 
 
+# Dates are stored ISO (YYYY-MM-DD) everywhere internally, because that's what
+# the JotForm API's date filters expect and what makes plain string sorting
+# come out in true chronological order. They get converted to US MM/DD/YYYY
+# only at the moment they're displayed or exported — so call to_us_dates()
+# LAST, after any sorting or filtering, never on data still being computed on.
+US_DATE_COLUMNS = {
+    "submitted_at": "%m/%d/%Y %I:%M %p",
+    "assessment_date": "%m/%d/%Y",
+}
+
+
+def to_us_dates(df):
+    """Return a copy of `df` with its date columns re-rendered MM/DD/YYYY.
+
+    A value that can't be parsed as a date is left exactly as JotForm sent
+    it rather than being blanked out, so bad data stays visible instead of
+    silently turning into an empty cell."""
+    if df is None or df.empty:
+        return df
+    out = df.copy()
+    for col, fmt in US_DATE_COLUMNS.items():
+        if col not in out.columns:
+            continue
+        parsed = pd.to_datetime(out[col], errors="coerce")
+        out[col] = parsed.dt.strftime(fmt).where(parsed.notna(), out[col])
+    return out
+
+
 # ---------------------------------------------------------------------------
 # JotForm API
 # ---------------------------------------------------------------------------
@@ -1034,9 +1071,9 @@ selected_forms = st.multiselect("Select form(s):", options=form_names, default=f
 
 col_d1, col_d2 = st.columns(2)
 with col_d1:
-    start_date = st.date_input("Start date")
+    start_date = st.date_input("Start date", **DATE_FMT)
 with col_d2:
-    end_date = st.date_input("End date")
+    end_date = st.date_input("End date", **DATE_FMT)
 
 # ---- Location picker ----
 # A keyed multiselect ignores `default` on every rerun after the first, so if
@@ -1056,15 +1093,25 @@ if not selected_locations:
         "Click **Select all locations** below if that isn't what you meant."
     )
 
+# These run as button CALLBACKS, which fire before the next script run
+# starts — i.e. before the multiselect above has been re-created. That's the
+# only safe window in which Streamlit will let us write to a widget's own
+# session-state key. Writing to it inline (after the widget exists) raises
+# StreamlitAPIException, and calling st.rerun() inside a callback raises too,
+# so neither of those belongs here.
+def _select_all_locations():
+    st.session_state['selected_locations_widget'] = list(st.session_state['locations'])
+
+
+def _clear_locations():
+    st.session_state['selected_locations_widget'] = []
+
+
 col_s1, col_s2, _ = st.columns([1, 1, 3])
 with col_s1:
-    if st.button("Select all locations"):
-        st.session_state['_reload_location_widget'] = True
-        st.rerun()
+    st.button("Select all locations", key="select_all_locs_btn", on_click=_select_all_locations)
 with col_s2:
-    if st.button("Clear locations"):
-        st.session_state['selected_locations_widget'] = []
-        st.rerun()
+    st.button("Clear locations", key="clear_locs_btn", on_click=_clear_locations)
 
 # Sheet-loading diagnostics (blank quotas, unlabelled columns, fallback list
 # in use) are configuration problems, not something a normal viewer can act
@@ -1379,14 +1426,17 @@ if st.button("Run Report", type="primary"):
                     "Names are free text on the form, so the same person can appear "
                     "under more than one spelling."
                 )
-                st.dataframe(assessment_details, **FILL)
+                st.dataframe(to_us_dates(assessment_details), **FILL)
 
             st.subheader("Raw Data")
             # The four assessment columns are blank on every other form, so
             # they're stripped here to keep the general Raw Data sheet clean.
-            df_raw_display = df_raw.drop(
+            # to_us_dates() is applied last, once sorting and filtering are
+            # done, so the underlying ISO values were used for all of that.
+            df_raw_display = to_us_dates(df_raw.drop(
                 columns=[c for c in ASSESSMENT_COLUMNS if c in df_raw.columns]
-            )
+            ))
+            assessment_export = to_us_dates(assessment_details)
             st.dataframe(df_raw_display, **FILL)
 
             if not df_raw.empty:
@@ -1399,7 +1449,7 @@ if st.button("Run Report", type="primary"):
                 compliance_summary.to_excel(writer, index=False, sheet_name='Compliance Summary')
                 leaderboard.to_excel(writer, index=False, sheet_name='Leaderboard')
                 df_raw_display.to_excel(writer, index=False, sheet_name='Raw Data')
-                assessment_details.to_excel(writer, index=False, sheet_name='Driver Assessments')
+                assessment_export.to_excel(writer, index=False, sheet_name='Driver Assessments')
                 submission_count.to_excel(writer, index=False, sheet_name='Submission Count')
             st.download_button(
                 label="Download Excel File",
