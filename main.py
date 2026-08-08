@@ -7,6 +7,8 @@ import html
 import json
 import copy
 import inspect
+import os
+import base64
 import gspread
 from google.oauth2.service_account import Credentials
 
@@ -928,20 +930,160 @@ def leaderboard_with_badges(compliance_summary):
 # ---------------------------------------------------------------------------
 # STREAMLIT UI
 # ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# Company logo
+# ---------------------------------------------------------------------------
+# Commit the logo into an "assets" folder in the repo root, next to main.py:
+#     jotformdashboard/
+#       main.py
+#       assets/EPGS-HorizontalLogo-Color.svg
+#       .streamlit/config.toml
+#
+# Either the SVG or the PNG works — whichever is present is used, SVG first.
+# The SVG is preferred because it's vector (sharp on high-DPI screens) and
+# genuinely transparent. The PNG has an alpha channel but no transparent
+# pixels, so its background is solid white: fine on the light theme this app
+# pins in config.toml, but it would show as a white box on a dark background.
+#
+# WHY THE IMAGE IS EMBEDDED AS A DATA URI RATHER THAN PASSED TO st.image():
+# st.image() routes bitmaps through PIL, which doesn't read SVG, so support
+# for .svg paths varies by Streamlit version. Base64-encoding the file into
+# an <img> tag sidesteps that entirely and renders crisply at any size on
+# any version. It also keeps the SVG's internal <style> block (.st0/.st1)
+# scoped inside the image, where it can't collide with the page's own CSS
+# classes — which inlining the raw <svg> markup would risk.
+#
+# If neither file is found the app renders the title alone instead of
+# crashing, so a bad filename degrades quietly rather than taking the
+# dashboard down.
+LOGO_CANDIDATES = [
+    "assets/EPGS-HorizontalLogo-Color.svg",     # preferred: vector, transparent
+    "assets/EPGS-HorizontalLogo-Color-50.png",  # fallback: raster, white bg
+]
+LOGO_HEIGHT_PX = 64          # logo is ~2.8:1, so 64px tall ≈ 181px wide
+
+LOGO_PATH = next((p for p in LOGO_CANDIDATES if os.path.exists(p)), None)
+
+_LOGO_MIME = {
+    ".svg": "image/svg+xml",
+    ".png": "image/png",
+    ".jpg": "image/jpeg",
+    ".jpeg": "image/jpeg",
+}
+
+
+@st.cache_data(show_spinner=False)
+def load_logo_data_uri(path: str) -> str:
+    """Read an image off disk and return it as a base64 data URI."""
+    mime = _LOGO_MIME.get(os.path.splitext(path)[1].lower(), "image/png")
+    with open(path, "rb") as fh:
+        encoded = base64.b64encode(fh.read()).decode("ascii")
+    return f"data:{mime};base64,{encoded}"
+
+
+if LOGO_PATH:
+    try:
+        _logo_uri = load_logo_data_uri(LOGO_PATH)
+        st.markdown(
+            f'<img src="{_logo_uri}" '
+            f'alt="Evolution Parking &amp; Guest Services" '
+            f'style="height:{LOGO_HEIGHT_PX}px;margin-bottom:0.75rem;">',
+            unsafe_allow_html=True,
+        )
+    except Exception:
+        pass
+
+    # st.logo() pins the logo above the sidebar on Streamlit 1.35+. It's
+    # wrapped because older builds don't have it at all.
+    if hasattr(st, "logo"):
+        try:
+            st.logo(LOGO_PATH)
+        except Exception:
+            pass
+
 st.title("JotForm Compliance Dashboard")
+
+# ---------------------------------------------------------------------------
+# Evolution brand palette
+# ---------------------------------------------------------------------------
+# Pulled from the computed styles on Evolution's own site, so these are the
+# colors actually rendered in production rather than a guess. Change a value
+# here and it propagates through every rule in the CSS block below.
+BRAND = {
+    "teal":       "#00C0B5",   # primary brand color
+    "teal_dark":  "#00938B",   # hover / active state
+    "teal_pale":  "#C8F0EE",   # tints and fills
+    "slate":      "#313C48",   # headings
+    "gray_text":  "#616365",   # body copy
+    "sand":       "#E2E2D2",   # warm neutral
+    "border":     "#E2E2E2",   # borders and dividers
+    "gray_bg":    "#EFEFEF",   # subtle backgrounds
+}
 
 # The admin/settings expanders are made small and low-contrast so they don't
 # draw attention during normal use, but stay fully readable and clickable.
-#
-# The previous version forced this text to #ffffff to blend into Streamlit's
-# LIGHT background. On a dark theme that made these sections bright white and
-# more prominent than everything else — the opposite of the intent. Using
-# opacity instead works on both themes.
+# Opacity is used rather than a hardcoded text color so this works the same
+# on light and dark themes.
 st.markdown(
-    """
+    f"""
     <style>
-    [data-testid="stExpander"] summary { font-size: 0.8rem; opacity: 0.55; }
-    [data-testid="stExpander"] summary:hover { opacity: 1; }
+    [data-testid="stExpander"] summary {{ font-size: 0.8rem; opacity: 0.55; }}
+    [data-testid="stExpander"] summary:hover {{ opacity: 1; }}
+
+    /* ---- Headings ---- */
+    h1, h2, h3 {{ color: {BRAND['slate']}; }}
+    h1 {{ border-bottom: 3px solid {BRAND['teal']}; padding-bottom: 0.3rem; }}
+
+    /* ---- Primary button (Run Report) ---- */
+    .stButton > button[kind="primary"] {{
+        background-color: {BRAND['teal']};
+        border-color: {BRAND['teal']};
+        color: #FFFFFF;
+    }}
+    .stButton > button[kind="primary"]:hover,
+    .stButton > button[kind="primary"]:focus {{
+        background-color: {BRAND['teal_dark']};
+        border-color: {BRAND['teal_dark']};
+        color: #FFFFFF;
+    }}
+
+    /* ---- Secondary buttons ---- */
+    .stButton > button[kind="secondary"] {{
+        border-color: {BRAND['border']};
+        color: {BRAND['slate']};
+    }}
+    .stButton > button[kind="secondary"]:hover {{
+        border-color: {BRAND['teal']};
+        color: {BRAND['teal_dark']};
+    }}
+
+    /* ---- KPI metric cards ---- */
+    [data-testid="stMetric"] {{
+        background-color: {BRAND['teal_pale']};
+        border-left: 4px solid {BRAND['teal']};
+        border-radius: 4px;
+        padding: 0.75rem 1rem;
+    }}
+    [data-testid="stMetricLabel"] {{ color: {BRAND['gray_text']}; }}
+    [data-testid="stMetricValue"] {{ color: {BRAND['slate']}; }}
+
+    /* ---- Multiselect chips (selected forms / locations) ---- */
+    [data-baseweb="tag"] {{
+        background-color: {BRAND['teal']} !important;
+        color: #FFFFFF !important;
+    }}
+
+    /* ---- Sidebar ---- */
+    [data-testid="stSidebar"] {{
+        background-color: {BRAND['gray_bg']};
+        border-right: 1px solid {BRAND['border']};
+    }}
+
+    /* ---- Spinner + progress ---- */
+    .stSpinner > div {{ border-top-color: {BRAND['teal']} !important; }}
+    [data-testid="stProgressBar"] > div > div > div {{
+        background-color: {BRAND['teal']};
+    }}
     </style>
     """,
     unsafe_allow_html=True,
