@@ -1,0 +1,20 @@
+# Evolution Parking & Guest Services brand theme
+#
+# This file must live at .streamlit/config.toml in the repo root — same level
+# as main.py, inside a folder literally named ".streamlit" (with the dot).
+# Streamlit reads it at startup; it is NOT something you paste into the
+# Secrets box. Colors here drive the widget internals (checkboxes, date
+# picker, slider handles, focus rings) that CSS can't reliably reach.
+#
+# Colors taken from Evolution's own site:
+#   #00C0B5  primary teal
+#   #00938B  dark teal
+#   #313C48  slate (headings)
+#   #616365  body gray
+
+[theme]
+primaryColor = "#00C0B5"
+backgroundColor = "#FFFFFF"
+secondaryBackgroundColor = "#EFEFEF"
+textColor = "#313C48"
+font = "sans serif"
