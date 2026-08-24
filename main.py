@@ -513,6 +513,8 @@ LOCATION_ALIASES = {
     "TX -  CY & RI Austin Downtown": "TX - CY RI Austin Downtown",
     "TX - CY & RI Austin Downtown": "TX - CY RI Austin Downtown",
     "TX - Courtyard Residence Inn Austin DT": "TX - CY RI Austin Downtown",
+    "FL - Hilton Tampa": "FL - Hilton Tampa Downtown",
+    "FL - Embassy Suites Tampa": "FL - Embassy Tampa Downtown", 
 }
 
 
@@ -1491,6 +1493,20 @@ if is_admin:
                                 "in_current_location_list": (loc_val in locations) if loc_val else False,
                             })
                         st.dataframe(pd.DataFrame(rows), **FILL)
+                        unmatched = {v: int(c) for v, c in counts.items()
+                        if isinstance(v, str) and v and v not in locations}
+                        if unmatched:
+                            st.error(
+                                f"❌ {sum(unmatched.values())} submission(s) across "
+                                f"{len(unmatched)} name(s) are being DROPPED."
+                            )
+                            st.write(unmatched)
+                        else:
+                            st.success("✅ Every submitted location maps to the list.")
+                        matched = {v for v in counts.index if isinstance(v, str) and v in locations}
+                        silent = sorted(set(locations) - matched)
+                        st.write(f"**Zero submissions ({len(silent)} of {len(locations)}):**")
+                        st.write(silent or "None — every location reported.")
                 except JotFormError as e:
                     st.error(str(e))
 
