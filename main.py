@@ -622,9 +622,48 @@ LOCATIONS_HEADER_ALIASES = {"location list", "location", "locations", "location 
 ALIASES_HEADER = ["Submitted Value", "Maps To"]
 
 
+def _secret(key, default=None):
+    """Read one Streamlit secret, returning `default` if there are none.
+
+    st.secrets raises StreamlitSecretNotFoundError as soon as it is touched
+    when no secrets.toml exists ANYWHERE — and `.get()` is not exempt, because
+    it parses the file before it can fall back to a default. So on a fresh
+    clone, a Codespace, or a devcontainer with no secrets file, reading a
+    secret at import time crashes the whole app with a traceback instead of
+    rendering a page that could tell you what is missing.
+
+    Every secret read goes through here so the app always loads and can
+    explain itself. Missing configuration is a normal state, not a crash.
+    """
+    try:
+        return st.secrets.get(key, default)
+    except Exception:
+        return default
+
+
+def has_secrets():
+    """True if a secrets.toml was found at all. Used for setup guidance."""
+    try:
+        st.secrets.get("__probe__", None)
+        return True
+    except Exception:
+        return False
+
+
 def get_gsheet_client():
-    """Authenticated gspread client from the service account in secrets."""
-    creds_dict = dict(st.secrets["gcp_service_account"])
+    """Authenticated gspread client from the service account in secrets.
+
+    Raises a plain-language error rather than a traceback when the
+    credentials block is missing, which is the usual state on a fresh local
+    checkout.
+    """
+    creds_block = _secret("gcp_service_account")
+    if not creds_block:
+        # KeyError specifically: every call site already catches it and shows
+        # "No 'gcp_service_account' credentials found in st.secrets." Raising
+        # anything else would escape those handlers as a traceback.
+        raise KeyError("gcp_service_account")
+    creds_dict = dict(creds_block)
     creds = Credentials.from_service_account_info(creds_dict, scopes=GOOGLE_SHEETS_SCOPES)
     return gspread.authorize(creds)
 
@@ -1584,7 +1623,7 @@ st.markdown(
 # ===========================================================================
 # SECTION 11 — SESSION SETUP: CREDENTIALS, ADMIN GATE, SHEET LOAD
 # ===========================================================================
-api_key = st.secrets.get("API_KEY", "")
+api_key = _secret("API_KEY", "")
 
 # Hides the admin tabs from everyone except whoever knows the password. Set it
 # in Streamlit secrets as ADMIN_PASSWORD.
@@ -1598,7 +1637,7 @@ api_key = st.secrets.get("API_KEY", "")
 #
 # If ADMIN_PASSWORD isn't set, the app falls back to unlocking with ?admin=1
 # on the URL — convenient, but anyone who sees you do it can repeat it.
-ADMIN_PASSWORD = st.secrets.get("ADMIN_PASSWORD", "")
+ADMIN_PASSWORD = _secret("ADMIN_PASSWORD", "")
 
 
 def _get_query_params():
@@ -1619,7 +1658,7 @@ if "is_admin" not in st.session_state:
     )
 
 if "overrides_sheet_url" not in st.session_state:
-    st.session_state["overrides_sheet_url"] = st.secrets.get("overrides_sheet_url", "")
+    st.session_state["overrides_sheet_url"] = _secret("overrides_sheet_url", "")
 
 
 def load_everything_from_sheet(ref, messages):
@@ -1768,6 +1807,17 @@ if not api_key:
 # Sheet diagnostics are configuration problems a normal viewer can't act on,
 # so they're admin-only — except a missing location list, which stops the
 # whole dashboard and everyone needs to know about it.
+if not has_secrets():
+    st.warning(
+        "**No secrets file found, so this app has nothing to connect to.** "
+        "That is normal on a fresh clone, a Codespace or a devcontainer.\n\n"
+        "Create `.streamlit/secrets.toml` next to `main.py` (it is gitignored) "
+        "and copy `.streamlit/secrets.toml.example` into it, or set them under "
+        "Settings → Secrets in Streamlit Cloud. Full walkthrough in "
+        "`docs/STAGING.md`.",
+        icon="🔑",
+    )
+
 if REGISTRY_PROBLEMS:
     st.error(
         "**The form registry at the top of `main.py` has a problem.** Reports "
