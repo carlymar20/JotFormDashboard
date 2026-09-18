@@ -1,0 +1,368 @@
+# JotForm Compliance Dashboard — Maintenance Guide
+
+Everything you need to understand, run, fix, or rebuild this dashboard.
+Written for someone who has never seen it before.
+
+Canonical copy. If this file and any other doc disagree, this one is right.
+
+Setting up a staging app is covered separately in [`STAGING.md`](STAGING.md).
+
+---
+
+## Part 0 — What this thing is, in one paragraph
+
+EPGS staff fill in JotForm forms at parking and valet sites. Some of those
+forms are required a certain number of times per day, week or month. This app
+pulls every submission from JotForm, works out how many each site *should*
+have done, compares that to what they actually did, and produces a compliance
+report plus an Excel export. It runs on Streamlit Community Cloud and deploys
+straight from the `main` branch of this repo.
+
+It is one Python file, `main.py`, plus a Google Sheet that holds everything
+that changes.
+
+---
+
+## Part 1 — How the data flows
+
+```
+  JotForm forms                Google Sheet (4 tabs)
+        |                              |
+        | JotForm API                  | gspread
+        v                              v
+  get_submissions()            Locations   <- the master site list
+        |                      Aliases     <- submitted value -> master name
+        v                      Overrides   <- per-site quota changes
+   extract_row()               Operating Days <- which days a site is open
+        |                              |
+        |  normalize_location() <-------'  (uses Aliases)
+        v
+   one row per submission
+        |
+        +--> compute_period_targets()  -> Compliance Summary -> Leaderboard
+        +--> build_detail_table()      -> the "who" tables (names)
+        +--> build_location_health()   -> Location Health tab
+        +--> Excel export
+```
+
+### The one thing that causes most problems
+
+A submission is only counted if its location text **exactly matches** a name
+on the master list. Not "close to". Exactly, after trimming spaces and
+decoding HTML entities.
+
+There are two kinds of location dropdown in JotForm:
+
+- **Reusable dropdown** — fed by the master location table in JotForm. Values
+  match the master list automatically. Six forms use this.
+- **Static list** — a list typed into the form by hand years ago. It drifts
+  the moment anyone adds or renames a site. Four forms still use this:
+  **Lot Audit**, **Parking/Work Area Hazard**, **Valet Driver Assessment**,
+  **Shuttle Driver Assessment**.
+
+When a static form sends `FL - Embassy Downtown Tampa` and the master list
+says `FL - Embassy Tampa Downtown`, the submission matches nothing and is
+thrown away silently. Nobody gets an error. The site just reads 0%.
+
+**Aliases are the fix.** An alias says "when a form sends *this*, count it as
+*that*". They live in the `Aliases` tab of the Google Sheet and are added from
+the Location Health tab in the app. No code change, no deploy.
+
+### Why pulls are cached, and why aliases are applied separately
+
+Pulling from JotForm is the slow part. Lot Audit alone is around 90,000
+submissions. So:
+
+- **Forms are fetched concurrently**, four at a time. First pull is roughly
+  three to four times faster than it used to be.
+- **The result is cached for 20 minutes**, keyed on the forms and date range.
+  Re-running the same report, opening Location Health, or downloading the
+  Excel costs nothing extra.
+- **Aliases are applied *after* the cache, on every render.** This is the
+  subtle part and it is deliberate. If aliasing happened during extraction it
+  would be baked into the cached rows, so saving an alias would appear to do
+  nothing for 20 minutes. Instead the cache stores only `location_raw`, and
+  `apply_location_aliases()` resolves it fresh each time. Save an alias and
+  the numbers change immediately, with no re-pull.
+- **"Force fresh pull"** on the Report tab bypasses the cache when you need
+  submissions from the last few minutes.
+
+Errors are never cached. A failed pull does not wedge a bad result in place.
+
+The permanent fix is moving those four forms onto the reusable dropdown in the
+JotForm builder. That is a known future task. Until it happens, aliases are
+not a workaround, they are how the system works.
+
+---
+
+## Part 2 — The moving parts
+
+### Files
+
+| File | What it is |
+| --- | --- |
+| `main.py` | The entire app |
+| `.streamlit/config.toml` | Brand theme colors. Read by Streamlit at startup. Not secrets. |
+| `.devcontainer/EPGS-HorizontalLogo-Color.svg` | The logo in the page header |
+| `requirements.txt` | Python packages Streamlit Cloud installs |
+| `docs/MAINTENANCE.md` | This file |
+
+### Secrets
+
+Set in Streamlit Cloud under **Settings → Secrets**. Never in the repo.
+
+| Key | What it does |
+| --- | --- |
+| `API_KEY` | JotForm API key. Without it nothing can be pulled. |
+| `ADMIN_PASSWORD` | Unlocks the Settings and Debug tabs. If unset, `?admin=1` on the URL unlocks them instead, which is fine for testing and bad for production. |
+| `overrides_sheet_url` | URL or ID of the Google Sheet |
+| `[gcp_service_account]` | Google service account credentials block. The sheet must be shared with the `client_email` inside it, with Editor access. |
+
+### `main.py`, section by section
+
+| Section | What lives there |
+| --- | --- |
+| 1 — The form registry | `FORMS`. Every tracked form, all in one place. **This is the only place you edit to add or remove a form.** |
+| 2 — Detail form columns | The extra columns the "who did it" forms add |
+| 3 — Location names | Aliasing and fuzzy suggestion. No hardcoded location list. |
+| 4 — Quotas and operating days | How a required count is resolved for one site |
+| 5 — Google Sheet persistence | Reading and writing the four tabs |
+| 6 — Answer parsing | Flattening JotForm's name and date widgets |
+| 7 — JotForm API | Fetching with retries, and `extract_row()` |
+| 8 — Location health | Finding dropped submissions |
+| 9 — Compliance math | Turning submissions into percentages |
+| 10 — Branding | Palette, logo, CSS |
+| 11 — Session setup | Secrets, admin gate, loading the sheet |
+| 12 — Tabs | Report, Location Health, Settings, Debug |
+
+### Functions worth knowing
+
+| Function | What it does |
+| --- | --- |
+| `extract_row(sub, form_id)` | One JotForm submission becomes one flat row. Stores `location_raw` only; does **not** alias. |
+| `apply_location_aliases(df, aliases)` | Resolves `location_raw` into `location`. Runs on every render, so alias edits apply to cached pulls. |
+| `fetch_rows_cached(...)` | The cached, concurrent pull. 20-minute TTL. |
+| `get_all_data(...)` | Pull plus aliasing. Deliberately does **not** filter by location, so mismatches survive to be counted. |
+| `_redact(text, api_key)` | Strips the API key out of anything shown on screen. Error messages from `requests` contain the full request URL, key included. |
+| `compute_period_targets(...)` | The compliance math. One row per (form, location). |
+| `build_location_health(...)` | What the Location Health tab shows. |
+| `_validate_registry(FORMS)` | Runs at startup. Catches registry typos before they produce wrong numbers. |
+
+### The form registry
+
+Each entry in `FORMS` is keyed by JotForm form ID:
+
+```python
+"223424048202040": {
+    "name": "Lot Audit",
+    "compliance": {"quota": 3, "interval": "daily"},
+    "location_fields": ["location"],
+    "location_source": "static list",
+    "detail": None,
+},
+```
+
+- `name` — used everywhere, including in the Google Sheet. Renaming it
+  orphans any Overrides or Operating Days rows that use the old name.
+- `compliance` — `None` means tracked and reported but never scored.
+- `location_fields` — JotForm's internal field names, in priority order.
+  First one with an answer wins.
+- `location_source` — `"reusable dropdown"` or `"static list"`.
+- `detail` — `None`, or a block for forms that record people's names.
+
+#### "Why does `location` appear in eight different forms?"
+
+That is not a duplicate. JotForm field names are scoped to a single form, so
+`location` on Lot Audit and `location` on Site Audit are two unrelated
+questions that happen to share a name. What would be a bug is the same name
+twice **inside one list**, and `_validate_registry()` refuses to start if that
+happens.
+
+#### "Why do most forms list two location fields?"
+
+When a form moved to the reusable dropdown it got a **new** question for it.
+The old dropdown was hidden rather than deleted, because deleting it would
+have wiped the location off every historical submission. So the list is
+`[new widget field, old retired field]` and whichever has an answer wins. That
+is what lets one report cover both old and new submissions.
+
+---
+
+## Part 3 — How do I… (step by step)
+
+### Add a new location
+
+1. Add it to the **JotForm master location table**
+   (`jotform.com/tables/261369268113156`, MASTER - Location List tab).
+2. Add the identical text to the **`Locations` tab** of the Google Sheet.
+   These two are meant to always match.
+3. Open the dashboard and click **Reload from Google Sheet** in the sidebar.
+4. The six forms on the reusable dropdown now offer the new site
+   automatically. **The four static forms do not.** Someone has to add it to
+   each of those dropdowns by hand in the JotForm builder, or nobody at that
+   site can submit those forms.
+5. If the site should not do every form, add `Quota = 0` rows for it in
+   Settings → Location quota overrides.
+
+### Fix "submissions are being dropped"
+
+1. Run a report covering the dates in question.
+2. Go to the **Location Health** tab.
+3. The top table lists every value that did not match, how many submissions it
+   is costing, and which form sent it.
+4. Pick the value, choose the master-list name it should count as, click
+   **Save alias to Google Sheet**.
+5. Re-run the report. Those submissions now count.
+
+Check the suggestion before saving. It is a text-similarity guess and two
+genuinely different sites can look similar. A wrong alias merges two sites and
+nobody will notice.
+
+### Add a new form
+
+1. Get the form ID from its URL: `form.jotform.com/<this number>`.
+2. Find its real field names. Either open the live form, right-click the
+   location dropdown, Inspect, and read the `name` attribute — a field named
+   `q47_location47` has the API name **`location47`**, the part after the
+   underscore — or use the app's **Debug → Field names** button, which lists
+   them from a real submission.
+3. Add one block to `FORMS` in `main.py`:
+
+```python
+"231726764166159": {
+    "name": "Shuttle Driver Assessment",
+    "compliance": None,                        # or {"quota": 1, "interval": "daily"}
+    "location_fields": ["schoolOr2"],
+    "location_source": "static list",
+    "detail": {                                # omit with None if it names nobody
+        "title": "Shuttle Assessments",
+        "sheet": "Shuttle Assessments",
+        "noun": "assessment",
+        "person_label": "team member",
+        "person_header": "Team member",
+        "second_header": "Assessor",
+        "fields": {
+            "person":        ["teamMember51", "teamMember"],
+            "second_person": ["assessorsName"],
+            "second_title":  ["assessorsTitle"],
+            "detail_date":   ["dateSection73", "date"],
+        },
+    },
+},
+```
+
+4. Change nothing else. Every lookup table is derived from `FORMS`.
+5. Deploy. If you got something wrong, the app shows a red banner at the top
+   naming the problem instead of quietly producing wrong numbers.
+
+List more than one candidate field name when you are unsure. They are tried in
+order and the first with an answer wins, which costs nothing and is how the
+app survives forms being cloned and fields renamed.
+
+### Stop tracking a form
+
+Delete its block from `FORMS`. Its historical submissions stop being pulled.
+Nothing else needs changing.
+
+### Change a quota
+
+- **For everyone**: edit `compliance` in that form's registry block. Needs a
+  deploy. Changing an interval rewrites historical percentages, so expect the
+  numbers to move.
+- **For one site**: Settings → Location quota overrides. No deploy.
+  - Blank quota = row ignored entirely.
+  - `0` = this site is not required to do this form. Shows as "Not required"
+    and is left out of the leaderboard average rather than counted as a zero.
+
+### Mark a site as open fewer than 7 days
+
+Settings → Location operating days. Check the days it *is* open. This only
+affects daily quotas; weekly and monthly are unchanged. Sites not listed are
+assumed open every day.
+
+### Deploy a change
+
+```bash
+git checkout staging
+# make the change
+git commit -am "what changed"
+git push
+# check it on the staging Streamlit app, then:
+git checkout main && git merge staging && git push
+```
+
+Streamlit Cloud redeploys automatically on push, in about a minute.
+
+### Rotate the JotForm API key
+
+Generate a new one in JotForm under **Settings → API**, revoke the old one,
+then update `API_KEY` in Streamlit Cloud's Secrets. The app restarts itself.
+
+---
+
+## Part 4 — Troubleshooting
+
+| Symptom | Most likely cause | Fix |
+| --- | --- | --- |
+| A site shows 0% | Its name is not in that form's dropdown, so nobody there can submit | Check the form's dropdown in the JotForm builder before treating it as a compliance failure |
+| A site shows 0% and Location Health lists a similar-looking value | Static dropdown drift | Add an alias |
+| Everything shows 0 and there is a red "No locations are loaded" banner | The Google Sheet is unreachable, or the `Locations` tab is empty | Check `overrides_sheet_url`, and that the sheet is shared with the service account's `client_email` |
+| Name columns are blank on a detail form | The form was cloned and its fields renamed | Debug → Field names, then add the real name to that form's `fields` list |
+| A change to the sheet has not shown up | The sheet loads once per session | Click **Reload from Google Sheet** in the sidebar |
+| A submission made minutes ago is missing | The pull is cached for 20 minutes | Tick **Force fresh pull** and re-run |
+| Red banner about the form registry | A typo in `FORMS` | The banner names the exact problem |
+| Quota override seems ignored | The Quota cell is blank | Blank means "ignored". Enter `0` for "not required". |
+| First report of the day is slow | Lot Audit alone is ~90,000 submissions, and the cache is cold | Narrow the date range, or deselect forms you do not need. Repeat runs within 20 minutes are instant. |
+| `JotForm API error ... 401` | Bad or revoked API key | Rotate it in Secrets |
+
+---
+
+## Part 5 — Rebuilding from scratch
+
+If the repo and the app both disappeared:
+
+1. **Repo** — `main.py`, `requirements.txt` (streamlit, pandas, openpyxl,
+   requests, gspread, google-auth), `.streamlit/config.toml`, the logo SVG.
+2. **Google Cloud** — create a project, enable the **Google Sheets API**,
+   create a **service account**, download its JSON key.
+3. **Google Sheet** — create one with tabs `Locations`, `Aliases`,
+   `Overrides`, `Operating Days`. Share it with the service account's
+   `client_email` as **Editor**. Missing tabs are created automatically, but
+   `Locations` has to be filled in by hand; there is no built-in fallback list
+   and that is deliberate.
+   - `Locations` — one column, header `Location List`
+   - `Aliases` — `Submitted Value`, `Maps To`
+   - `Overrides` — `Form`, `Location`, `Quota`, `Interval`
+   - `Operating Days` — `Location`, `Mon`…`Sun`
+4. **JotForm** — get an API key from Settings → API.
+5. **Streamlit Cloud** — point a new app at the repo and `main.py`, then paste
+   the secrets from Part 2.
+6. **Verify** — run a report over a known week and confirm the numbers match
+   what the old app said before trusting it.
+
+---
+
+## Part 6 — Known issues and future work
+
+- **Four forms are still on static dropdowns.** Lot Audit, Parking/Work Area
+  Hazard, Valet Driver Assessment and Shuttle Driver Assessment. Migrating
+  them to the reusable dropdown removes the entire class of location bug and
+  makes most aliases unnecessary. Blocked for now, not forgotten.
+- **Parking/Work Area Hazard is scored weekly**, but the form's own
+  instructions say daily. Left as-is deliberately: changing it rewrites every
+  historical compliance number. Decide, then change it once.
+- **Detail date fields are inferred.** The date field names on the detail
+  forms were read from the rendered forms, not confirmed against a real
+  submission. If a Date column comes back blank, Debug → Field names gives
+  the real name. Names and locations are confirmed.
+- **The `Locations` tab and the JotForm master table are maintained
+  separately** and are only kept in step by hand. Reading the master table
+  directly would remove that, but JotForm's API does not expose standalone
+  table rows through the normal submissions endpoint.
+- **The first pull of the day is still a live pull.** Caching and concurrency
+  made repeat runs instant and first runs a few times faster, but a cold pull
+  over a wide date range still waits on JotForm. If that becomes the
+  complaint, the next step is a scheduled job (GitHub Actions or Power
+  Automate) that syncs submissions into a store overnight, with the dashboard
+  reading the store instead of the API. That is a real project, not a tweak,
+  and it is only worth doing if cold pulls actually start hurting.
