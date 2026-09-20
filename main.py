@@ -62,10 +62,19 @@ st.set_page_config(
 # Streamlit renamed `use_container_width` to `width="stretch"` in newer
 # versions. Detect which one this install wants once, and splat FILL into any
 # dataframe/data_editor call so the app works on either version.
+#
+# IMPORTANT: newer Streamlit builds (including 1.64, what this app runs on)
+# keep `use_container_width` around as a *deprecated* alias for backward
+# compatibility even after adding `width`. That means both names show up in
+# the signature at once, so the previous check here (which required
+# `use_container_width` to be ABSENT before trusting `width`) never fired and
+# every dataframe/data_editor call kept using the deprecated kwarg — which is
+# exactly what was flooding the deploy logs with
+# "Please replace `use_container_width` with `width`" on every rerun. The fix
+# is to only check whether `width` is supported at all.
 try:
     _params = inspect.signature(st.dataframe).parameters
-    FILL = {"width": "stretch"} if ("width" in _params and "use_container_width" not in _params) \
-        else {"use_container_width": True}
+    FILL = {"width": "stretch"} if "width" in _params else {"use_container_width": True}
 except Exception:
     FILL = {"use_container_width": True}
 
@@ -1016,7 +1025,16 @@ def get_submissions(form_id, api_key, start_date=None, end_date=None):
 
 
 def extract_row(sub, form_id):
-    """One submission -> one flat row, using this form's confirmed fields."""
+    """One submission -> one flat row, using this form's confirmed fields.
+
+    NOTE: this row deliberately does NOT include a resolved "location" key —
+    only "location_raw". Alias resolution happens later, over a whole
+    DataFrame, via apply_location_aliases() / resolve_location() below, so
+    that an alias saved after a pull still applies to that (cached) pull
+    without another trip to JotForm. Any call site that needs the
+    alias-resolved value must go through one of those two, never index
+    row["location"] on what this function returns.
+    """
     answers = sub.get("answers", {})
     row = {
         "form_id": form_id,
@@ -1124,6 +1142,21 @@ def fetch_rows_cached(form_names, start_date, end_date, _api_key):
     if not all_rows:
         return pd.DataFrame(columns=BASE_RAW_COLUMNS + DETAIL_COLUMNS)
     return pd.DataFrame(all_rows)
+
+
+def resolve_location(raw_value, aliases):
+    """Alias-resolved location for ONE raw value.
+
+    This is the single-row equivalent of apply_location_aliases() (which
+    works over a whole DataFrame column at once). Use this wherever a row
+    dict straight out of extract_row() needs its location resolved —
+    extract_row() itself never sets a "location" key, only "location_raw",
+    so indexing row["location"] on its return value is always a bug.
+    """
+    if raw_value is None:
+        return None
+    mapping = aliases or {}
+    return mapping.get(raw_value, raw_value)
 
 
 def apply_location_aliases(df, aliases):
@@ -1556,6 +1589,26 @@ st.markdown(
     .stButton > button[kind="secondary"]:hover {{
         border-color: {BRAND['teal']};
         color: {BRAND['teal_dark']};
+    }}
+
+    /* ---- Focus ring override ----
+    Streamlit's built-in default theme color is red (#FF4B4B) and, unless a
+    [theme] section in .streamlit/config.toml overrides primaryColor, that
+    red shows up as the focus/active outline on ANY button — including plain
+    st.button() calls like "Location match check" and "Field names" that
+    never set kind="primary" at all. The rules above only override :hover,
+    not :focus, which is why a button can look fine at rest, flash red right
+    after being clicked, and stay that way until focus moves elsewhere. This
+    pins the focus ring to brand teal instead, for every button kind. If a
+    [theme] primaryColor is later set in config.toml, this block can be
+    removed and the native color will already be on-brand. */
+    .stButton > button:focus,
+    .stButton > button:focus:not(:active),
+    .stButton > button:focus-visible {{
+        border-color: {BRAND['teal']} !important;
+        color: {BRAND['teal_dark']} !important;
+        box-shadow: none !important;
+        outline-color: {BRAND['teal']} !important;
     }}
 
     /* ---- KPI metric cards ---- */
@@ -2455,13 +2508,24 @@ if tab_debug is not None:
                     "are visible."
                 )
                 try:
+                    _current_aliases = st.session_state.get("location_aliases", {})
                     for form_id in [FORM_NAME_TO_ID[n] for n in _forms]:
                         subs = get_submissions(form_id, api_key, _start, _end)
                         st.write(f"### {FORM_ID_TO_NAME[form_id]} — {len(subs)} submission(s)")
                         if not subs:
                             st.write("⚠️ No submissions returned at all for this form and date range")
                             continue
-                        extracted = [extract_row(s, form_id)["location"] for s in subs]
+                        # FIX: extract_row() only ever sets "location_raw", never
+                        # "location" — that key is added later, over a whole
+                        # DataFrame, by apply_location_aliases(). Indexing
+                        # ["location"] here on a single extract_row() dict raised
+                        # KeyError on every call. resolve_location() does the
+                        # same alias lookup apply_location_aliases() does, just
+                        # for one raw value at a time.
+                        extracted = [
+                            resolve_location(extract_row(s, form_id)["location_raw"], _current_aliases)
+                            for s in subs
+                        ]
                         counts = pd.Series(extracted).value_counts(dropna=False)
                         rows = []
                         for loc_val, count in counts.items():
@@ -2497,6 +2561,7 @@ if tab_debug is not None:
                 st.error("Select at least one form on the Report tab.")
             else:
                 try:
+                    _current_aliases = st.session_state.get("location_aliases", {})
                     for form_id in [FORM_NAME_TO_ID[n] for n in _forms]:
                         subs = get_submissions(form_id, api_key, _start, _end)
                         st.write(f"### {FORM_ID_TO_NAME[form_id]}")
@@ -2512,8 +2577,11 @@ if tab_debug is not None:
                                 for v in first["answers"].values()
                             })
                             row = extract_row(first, form_id)
+                            # FIX: same missing-key bug as "Location match check"
+                            # above — row["location"] never exists on a raw
+                            # extract_row() dict. Resolve it explicitly instead.
                             st.write({
-                                "location recorded": row["location"],
+                                "location recorded": resolve_location(row["location_raw"], _current_aliases),
                                 "raw value before aliasing": row["location_raw"],
                                 "person": row["person"],
                                 "second person": row["second_person"],
