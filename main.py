@@ -137,7 +137,26 @@ FORMS = {
         "compliance": None,
         "location_fields": ["location125", "location"],
         "location_source": "reusable dropdown",
-        "detail": None,
+        # Names pulled the same way Valet Driver Assessment / Shuttle / Uniform
+        # Issuance do. Confirmed live: "Team Member Name" is field "teamMember",
+        # "Conducted by" is field "conductedBy", "Date Conducted on" is
+        # "dateConducted3". This form has no separate title field for the
+        # evaluator (no "Assessor's Title" equivalent), so second_title is
+        # empty rather than pointing at a field that doesn't exist.
+        "detail": {
+            "title": "AWEstruck Evaluations",
+            "sheet": "AWEstruck Evaluations",
+            "noun": "evaluation",
+            "person_label": "team member",
+            "person_header": "Team member",
+            "second_header": "Conducted by",
+            "fields": {
+                "person":        ["teamMember"],
+                "second_person": ["conductedBy"],
+                "second_title":  [],
+                "detail_date":   ["dateConducted3"],
+            },
+        },
     },
     "242047162465151": {
         "name": "Daily Huddle",
@@ -194,7 +213,11 @@ FORMS = {
         "name": "Valet Driver Assessment",         # "Valet Driver Assessment as of 8/16/2026"
         "compliance": None,
         "location_fields": ["location"],
-        "location_source": "static list",          # currently matches, but will drift
+        # Converted to the reusable dropdown around 2026-09-16. Confirmed live
+        # against a 2026-09-20 submission: the field name itself did NOT
+        # change (still "location"), only its backing data source did, so
+        # location_fields needed no edit — just this flag.
+        "location_source": "reusable dropdown",
         "detail": {
             "title": "Driver Assessments",
             "sheet": "Driver Assessments",
@@ -213,12 +236,21 @@ FORMS = {
     "231726764166159": {
         # Built from the same template as the OLD valet assessment, so it uses
         # that form's field names (teamMember51, dateSection73) rather than the
-        # new valet form's. Its location field is named "schoolOr2", which
-        # looks like a mistake but is the real API name — do not "fix" it.
+        # new valet form's.
+        #
+        # Location moved onto the reusable dropdown on 2026-09-20. Confirmed
+        # live: the widget's field is named "typeA" (JotForm auto-names
+        # reusable-dropdown widgets this way; it happens to collide with the
+        # unrelated "typeA" field on other forms, which is fine — field names
+        # are scoped per form). "schoolOr2" is kept second so any submissions
+        # from before the conversion still resolve. There is also now a
+        # "Site Email" widget field (name "siteEmail") alongside it, matching
+        # the "Select Site Email" pattern on other reusable-dropdown forms;
+        # it isn't read anywhere, same as those other forms' email fields.
         "name": "Shuttle Driver Assessment",       # "EPGS Shuttle Driver Assessment"
         "compliance": None,
-        "location_fields": ["schoolOr2"],
-        "location_source": "static list",
+        "location_fields": ["typeA", "schoolOr2"],
+        "location_source": "reusable dropdown",
         "detail": {
             "title": "Shuttle Assessments",
             "sheet": "Shuttle Assessments",
@@ -1760,8 +1792,25 @@ def load_everything_from_sheet(ref, messages):
     return ok
 
 
+# How long the Google Sheet data is trusted before this app automatically
+# re-reads it, on top of the manual "⬇️ Reload from Google Sheet" button.
+#
+# Without this, the sheet was only ever read ONCE per browser session — the
+# block below ran on the session's first script execution and then never
+# again, because it's gated on a key that, once set, stays set for the rest
+# of that session. Someone editing the "Locations", "Aliases", "Overrides"
+# or "Operating Days" tab directly in the sheet had no way to reach an
+# already-open tab short of clicking Reload by hand, which is exactly what
+# was being reported: "the sheet is not automatically reloading." Ten
+# minutes matches the spirit of PULL_CACHE_TTL_SECONDS (the same tradeoff
+# for JotForm pulls, just for sheet data instead): frequent enough that an
+# edit shows up within one coffee break, rare enough that it doesn't hammer
+# the Sheets API on every rerun.
+SHEET_CACHE_TTL_SECONDS = 10 * 60
+
 if "sheet_loaded" not in st.session_state:
     st.session_state["sheet_loaded"] = True
+    st.session_state["sheet_loaded_at"] = time.time()
     st.session_state["sheet_messages"] = []
     st.session_state["locations"] = list(MASTER_LOCATIONS)
     st.session_state["locations_source"] = "not loaded"
@@ -1778,6 +1827,19 @@ if "sheet_loaded" not in st.session_state:
             "No Google Sheet is configured, so there are no locations to report on. "
             "Set `overrides_sheet_url` in secrets, or paste the sheet URL in Settings."
         )
+elif (time.time() - st.session_state.get("sheet_loaded_at", 0)) > SHEET_CACHE_TTL_SECONDS:
+    # The periodic reload itself. Deliberately does NOT reset session state
+    # to defaults first (unlike the first-load branch above) — if the sheet
+    # is briefly unreachable, load_everything_from_sheet() only overwrites
+    # each tab's session-state entry on that tab's own success, so the
+    # session keeps whatever good data it already had instead of going
+    # blank on a transient Sheets API hiccup.
+    _ref = st.session_state.get("overrides_sheet_url")
+    if _ref:
+        _auto_messages = []
+        load_everything_from_sheet(_ref, _auto_messages)
+        st.session_state["sheet_messages"] = _auto_messages
+    st.session_state["sheet_loaded_at"] = time.time()
 
 # Streamlit won't let us write to a widget's session-state key after the
 # widget has been created, so the buttons that change the location list set
@@ -1814,6 +1876,7 @@ def reload_from_sheet():
         return
     load_everything_from_sheet(ref, messages)
     st.session_state["sheet_messages"] = messages
+    st.session_state["sheet_loaded_at"] = time.time()
     st.session_state["_reload_location_widget"] = True
 
 
@@ -1830,6 +1893,10 @@ with st.sidebar:
     if st.button("🔄 Reload from Google Sheet", key="sidebar_reload"):
         reload_from_sheet()
         st.rerun()
+    st.caption(
+        f"Also auto-reloads every {SHEET_CACHE_TTL_SECONDS // 60} min in an open "
+        f"tab. Use this button for an edit you need to see right away."
+    )
 
     st.divider()
     st.markdown("### Admin")
@@ -1905,14 +1972,18 @@ tab_debug = _tabs[3] if is_admin else None
 # ---------------------------------------------------------------------------
 with tab_report:
     st.markdown("#### What to pull")
-    c1, c2 = st.columns([2, 1])
-    with c1:
-        form_names = list(FORM_NAME_TO_ID.keys())
-        selected_forms = st.multiselect(
-            "Forms", options=form_names, default=form_names, key="selected_forms_widget",
-        )
-    with c2:
-        filename = st.text_input("Excel filename (without .xlsx)", "JotForm_Compliance_Report") + ".xlsx"
+    form_names = list(FORM_NAME_TO_ID.keys())
+    # Full width, own row, with a fixed height. With all 9 forms selected by
+    # default (the common case) and only ~1/3 of the row's width to work
+    # with, the old side-by-side layout below collapsed most of the chips
+    # behind a small overflow icon instead of showing them. `height` lets
+    # Streamlit wrap chips onto multiple visible lines instead of cutting
+    # them off horizontally — bump it further if forms are ever added.
+    selected_forms = st.multiselect(
+        "Forms", options=form_names, default=form_names, key="selected_forms_widget",
+        height=110,
+    )
+    filename = st.text_input("Excel filename (without .xlsx)", "JotForm_Compliance_Report") + ".xlsx"
 
     d1, d2 = st.columns(2)
     with d1:
