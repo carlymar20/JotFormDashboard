@@ -52,7 +52,7 @@ from google.oauth2.service_account import Credentials
 
 st.set_page_config(
     page_title="JotForm Compliance Dashboard",
-    page_icon="📋",
+    page_icon="🚗",
     layout="wide",
 )
 
@@ -86,6 +86,19 @@ try:
         if "format" in inspect.signature(st.date_input).parameters else {}
 except Exception:
     DATE_FMT = {}
+
+# st.multiselect's `wrap` argument forces the selected-value chips to wrap
+# onto multiple rows instead of collapsing behind an overflow icon when the
+# widget is narrow or has many selections — exactly the Forms-box problem
+# below. Confirmed present in 1.64.0 (this deploy's pinned version), so no
+# Streamlit upgrade is needed for this; kept behind an inspect check anyway
+# in case this ever runs on an older build that predates it, same defensive
+# pattern as FILL and DATE_FMT above.
+try:
+    MULTISELECT_WRAP_KW = {"wrap": True} \
+        if "wrap" in inspect.signature(st.multiselect).parameters else {}
+except Exception:
+    MULTISELECT_WRAP_KW = {}
 
 
 # ===========================================================================
@@ -1981,7 +1994,7 @@ with tab_report:
     # them off horizontally — bump it further if forms are ever added.
     selected_forms = st.multiselect(
         "Forms", options=form_names, default=form_names, key="selected_forms_widget",
-        height=110,
+        **MULTISELECT_WRAP_KW,
     )
     filename = st.text_input("Excel filename (without .xlsx)", "JotForm_Compliance_Report") + ".xlsx"
 
