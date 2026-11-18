@@ -1613,27 +1613,25 @@ st.markdown(
         border-bottom-color: {BRAND['teal']};
     }}
 
-    /* ---- Primary button (Run Report) ---- */
-    .stButton > button[kind="primary"] {{
+    /* ---- Buttons ----
+    Every button (regular, download and form submit, primary or not) gets
+    the same filled teal as Run Report, dark teal on hover and press. */
+    .stButton > button,
+    .stDownloadButton > button,
+    .stFormSubmitButton > button {{
         background-color: {BRAND['teal']};
         border-color: {BRAND['teal']};
         color: #FFFFFF;
     }}
-    .stButton > button[kind="primary"]:hover,
-    .stButton > button[kind="primary"]:focus {{
+    .stButton > button:hover,
+    .stButton > button:active,
+    .stDownloadButton > button:hover,
+    .stDownloadButton > button:active,
+    .stFormSubmitButton > button:hover,
+    .stFormSubmitButton > button:active {{
         background-color: {BRAND['teal_dark']};
         border-color: {BRAND['teal_dark']};
         color: #FFFFFF;
-    }}
-
-    /* ---- Secondary buttons ---- */
-    .stButton > button[kind="secondary"] {{
-        border-color: {BRAND['border']};
-        color: {BRAND['slate']};
-    }}
-    .stButton > button[kind="secondary"]:hover {{
-        border-color: {BRAND['teal']};
-        color: {BRAND['teal_dark']};
     }}
 
     /* ---- Focus ring override ----
@@ -1649,11 +1647,18 @@ st.markdown(
     removed and the native color will already be on-brand. */
     .stButton > button:focus,
     .stButton > button:focus:not(:active),
-    .stButton > button:focus-visible {{
+    .stButton > button:focus-visible,
+    .stDownloadButton > button:focus,
+    .stDownloadButton > button:focus:not(:active),
+    .stDownloadButton > button:focus-visible,
+    .stFormSubmitButton > button:focus,
+    .stFormSubmitButton > button:focus:not(:active),
+    .stFormSubmitButton > button:focus-visible {{
+        background-color: {BRAND['teal']} !important;
         border-color: {BRAND['teal']} !important;
-        color: {BRAND['teal_dark']} !important;
+        color: #FFFFFF !important;
         box-shadow: none !important;
-        outline-color: {BRAND['teal']} !important;
+        outline-color: {BRAND['teal_dark']} !important;
     }}
 
     /* ---- KPI metric cards ---- */
