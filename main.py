@@ -46,13 +46,19 @@ import inspect
 import os
 import base64
 import difflib
+import datetime
+from zoneinfo import ZoneInfo
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import gspread
 from google.oauth2.service_account import Credentials
 
+# Browser-tab icon: the EPGS pineapple, cut from the vertical logo. Falls back
+# to the old emoji if the file is ever missing so a bad path can't stop the app.
+PAGE_ICON_PATH = "assets/epgs-icon.png"
+
 st.set_page_config(
     page_title="JotForm Compliance Dashboard",
-    page_icon="🚗",
+    page_icon=PAGE_ICON_PATH if os.path.exists(PAGE_ICON_PATH) else "🚗",
     layout="wide",
 )
 
@@ -77,6 +83,10 @@ try:
     FILL = {"width": "stretch"} if "width" in _params else {"use_container_width": True}
 except Exception:
     FILL = {"use_container_width": True}
+
+# Read-only tables also hide pandas' 0, 1, 2 row numbers, which mean nothing to
+# anyone reading the report. Editable tables (Settings) keep plain FILL.
+TABLE = {**FILL, "hide_index": True}
 
 # Same idea for st.date_input's `format` argument, which only exists on
 # Streamlit 1.30+. On older builds we leave it off rather than crash — the
@@ -146,7 +156,9 @@ except Exception:
 # Field names below were read live off each rendered form on 2026-09-14/15.
 FORMS = {
     "250265807744158": {
-        "name": "AWEstruck Arival/Departure",
+        # Spelling fixed from "Arival" on 2026-11-18. Safe because no Overrides
+        # rows used the old name (checked the sheet) and this form has no quota.
+        "name": "AWEstruck Arrival/Departure",
         "compliance": None,
         "location_fields": ["location125", "location"],
         "location_source": "reusable dropdown",
@@ -392,6 +404,37 @@ DETAIL_FORM_IDS = {fid: cfg["name"] for fid, cfg in FORMS.items() if cfg.get("de
 # Used only by the "Location field setup" debug tool, which scans for anything
 # mentioning "location". Not used to decide which field's answer to pull.
 LOCATION_MATCH_WORD = "location"
+
+
+# ===========================================================================
+# SECTION 1B — SHUTTLE INSPECTIONS
+# ===========================================================================
+# Shuttle inspections are NOT one form. Each shuttle site has its own "Daily
+# Shuttle Inspection" form in JotForm, so the site comes from WHICH form was
+# submitted, not from a location question. That's why these live in their own
+# map instead of the FORMS registry above, and why they get their own box in
+# the report rather than a chip in the Forms picker: the box shows up on its
+# own whenever the selected locations include one of these sites.
+#
+# Rule: one inspection per operating day (Operating Days tab). A day counts
+# once however many inspections it has, so two on Monday don't cover Tuesday.
+#
+# Form id -> master-list location name. Ids confirmed in JotForm 2026-11-18.
+# Left out on purpose: Sky Beach Resort (253445471578163, site isn't on the
+# master list), "Shuttle Log - MOKE" and the JW Marriott SpringTime 2025
+# employee shuttle (both 2025 one-offs). To add a site, add one line here.
+SHUTTLE_INSPECTION_FORMS = {
+    "230815808234152": "TX - Intercontinental Houston Medical",
+    "250963780419162": "CA - Hilton Costa Mesa",                 # "Hilton Orange County, Costa Mesa"
+    "231015075916148": "TX - DoubleTree Houston",                # "DoubleTree Houston Greenway Plaza"
+    "231875297830163": "IL - Waldorf Astoria Chicago",           # house car shuttle
+    "250586907706163": "FL - HCC Ybor City Shuttle",             # GEM shuttle
+    "232084621604146": "FL - JW Marriott Clearwater",            # Moke shuttle
+    "260815322799162": "FL - Westin Sarasota",
+    "262708613052150": "NC - Hotel Ballast",                     # Wilmington, NC
+}
+SHUTTLE_SITE_TO_FORM = {site: fid for fid, site in SHUTTLE_INSPECTION_FORMS.items()}
+SHUTTLE_SHEET = "Shuttle Inspections"
 
 
 # ===========================================================================
@@ -1041,8 +1084,13 @@ def get_form_questions(form_id, api_key):
     return r.json()["content"]
 
 
-def get_submissions(form_id, api_key, start_date=None, end_date=None):
-    """Page through every submission for one form in the date range."""
+def get_submissions(form_id, api_key, start_date=None, end_date=None, label=None):
+    """Page through every submission for one form in the date range.
+
+    `label` names the form in error messages when it isn't in FORMS (the
+    per-site shuttle inspection forms).
+    """
+    label = label or FORM_ID_TO_NAME.get(form_id, form_id)
     all_submissions = []
     batch_size = 1000
     offset = 0
@@ -1059,7 +1107,7 @@ def get_submissions(form_id, api_key, start_date=None, end_date=None):
         r = _api_get(
             f"https://api.jotform.com/form/{form_id}/submissions",
             params,
-            f"'{FORM_ID_TO_NAME.get(form_id, form_id)}'",
+            f"'{label}'",
         )
         submissions = r.json()["content"]
         all_submissions.extend(submissions)
@@ -1498,17 +1546,245 @@ def leaderboard_with_badges(compliance_summary):
 
     def badge_row(row):
         p = row["overall_percent"]
+        # Plain words; the report colors the cell by badge (see tint_cells).
         if p >= 100:
-            return "🏅 Gold Star"
+            return "Gold Star"
         elif p >= 90:
-            return "🥈 Silver Star"
+            return "Silver Star"
         elif p >= 75:
-            return "🥉 Bronze Star"
-        return "🚩 Needs Improvement"
+            return "Bronze Star"
+        return "Needs Improvement"
 
     leader["Badge"] = leader.apply(badge_row, axis=1)
     leader["Rank"] = leader["overall_percent"].rank(method="min", ascending=False).astype(int)
     return leader[cols]
+
+
+# ---------------------------------------------------------------------------
+# Shuttle inspections (see SECTION 1B)
+# ---------------------------------------------------------------------------
+# How far back to look for each site's most recent inspection. One query per
+# site covers both the report range and this window, so "Last inspection" can
+# show a date from before the report started (that's how a site that stopped
+# inspecting weeks ago stands out).
+SHUTTLE_LOOKBACK_DAYS = 365
+SHUTTLE_COLUMNS = ["site", "form_id", "submitted_at"]
+
+
+def shuttle_sites_for(location_list):
+    """Shuttle sites among these locations, in the order given."""
+    return [loc for loc in location_list or [] if loc in SHUTTLE_SITE_TO_FORM]
+
+
+def _fetch_shuttle_site(form_id, api_key, start_date, end_date):
+    """One shuttle site's inspections in the window. Thread-safe (no st.*)."""
+    site = SHUTTLE_INSPECTION_FORMS[form_id]
+    subs = get_submissions(form_id, api_key, start_date, end_date,
+                           label=f"Daily Shuttle Inspection ({site})")
+    return [{"site": site, "form_id": form_id, "submitted_at": s.get("created_at")}
+            for s in subs]
+
+
+@st.cache_data(ttl=PULL_CACHE_TTL_SECONDS, max_entries=PULL_CACHE_MAX_ENTRIES,
+               show_spinner=False)
+def fetch_shuttle_cached(sites, start_date, end_date, _api_key):
+    """Inspections for these shuttle sites between the two dates.
+
+    `sites` must be a TUPLE so Streamlit can hash it; see fetch_rows_cached
+    for why _api_key carries a leading underscore.
+    """
+    rows = []
+    with ThreadPoolExecutor(max_workers=min(PULL_MAX_WORKERS, max(len(sites), 1))) as pool:
+        futures = [pool.submit(_fetch_shuttle_site, SHUTTLE_SITE_TO_FORM[site],
+                               _api_key, start_date, end_date)
+                   for site in sites]
+        for future in as_completed(futures):
+            rows.extend(future.result())
+    return pd.DataFrame(rows, columns=SHUTTLE_COLUMNS)
+
+
+def get_shuttle_data(sites, start_date, end_date, api_key, force=False):
+    """Shuttle inspections from SHUTTLE_LOOKBACK_DAYS before the end date (or
+    the start date, if earlier) through the end date."""
+    if force:
+        fetch_shuttle_cached.clear()
+    end = pd.to_datetime(end_date).date()
+    lookback = min(pd.to_datetime(start_date).date(),
+                   end - datetime.timedelta(days=SHUTTLE_LOOKBACK_DAYS))
+    return fetch_shuttle_cached(tuple(sites), lookback, end, api_key)
+
+
+def build_shuttle_table(df, sites, start_date, end_date, operating_days=None):
+    """One row per shuttle site: days inspected out of days open in the range.
+
+    A day counts once however many inspections it has. Days the site is closed
+    (Operating Days tab) aren't required. Sites with misses sort to the top.
+    """
+    start_s = pd.to_datetime(start_date).strftime("%Y-%m-%d")
+    end_s = pd.to_datetime(end_date).strftime("%Y-%m-%d")
+    all_days = pd.date_range(start_date, end_date, freq="D")
+    rows = []
+    for site in sites:
+        site_rows = df[df["site"] == site] if df is not None and not df.empty else None
+        dates = (site_rows["submitted_at"].dropna().astype(str).str[:10]
+                 if site_rows is not None and not site_rows.empty
+                 else pd.Series(dtype=str))
+        in_range = dates[(dates >= start_s) & (dates <= end_s)]
+        open_days = get_operating_days_for(site, operating_days)
+        required = {d.strftime("%Y-%m-%d") for d in all_days if d.weekday() in open_days}
+        covered = len(required & set(in_range))
+        missing = len(required) - covered
+        if not required:
+            status = "Not open in range"
+        elif missing == 0:
+            status = "Met"
+        else:
+            status = f"Missing {missing} day" + ("" if missing == 1 else "s")
+        last = dates.max() if len(dates) else None
+        rows.append({
+            "Site": site,
+            "Status": status,
+            "Days inspected": f"{covered} of {len(required)}",
+            "Coverage": round(100 * covered / len(required), 1) if required else 100.0,
+            "Inspections": int(len(in_range)),
+            "Last inspection": (pd.to_datetime(last).strftime("%m/%d/%Y") if last
+                                else f"None in the past {SHUTTLE_LOOKBACK_DAYS // 30} months"),
+            "_missing": missing,
+            "_required": len(required),
+            "_covered": covered,
+        })
+    out = pd.DataFrame(rows)
+    if out.empty:
+        return out
+    return out.sort_values(["_missing", "Site"], ascending=[False, True]).reset_index(drop=True)
+
+
+# ---------------------------------------------------------------------------
+# Report display: readable column names, colored status, plurals
+# ---------------------------------------------------------------------------
+# Internal column -> what people see, in the order they see it. Used for the
+# on-screen tables AND the Excel sheets, so both read the same. Computation
+# keeps using the internal names; this is applied last.
+COMPLIANCE_DISPLAY = {
+    "form_name": "Form",
+    "location": "Location",
+    "status": "Status",
+    "percent_complete": "% Complete",
+    "actual_total": "Submitted",
+    "target_total": "Required",
+    "interval": "Frequency",
+    "quota_per_period": "Per period",
+    "periods_in_range": "Periods",
+    "custom_quota": "Custom quota",
+    "open_days_per_week": "Days open/week",
+}
+LEADERBOARD_DISPLAY = {
+    "Rank": "Rank",
+    "location": "Location",
+    "Badge": "Badge",
+    "overall_percent": "Overall",
+    "forms_tracked": "Forms tracked",
+    "total_target": "Required",
+    "total_actual": "Submitted",
+}
+RAW_DISPLAY = {
+    "form_name": "Form",
+    "submitted_at": "Submitted",
+    "location_raw": "Location (as entered)",
+    "location": "Location",
+    "submission_id": "Submission ID",
+    "form_id": "Form ID",
+}
+
+
+def for_display(df, mapping):
+    """`df` reordered and renamed per `mapping`; empty-safe."""
+    if df is None or df.empty:
+        return pd.DataFrame(columns=list(mapping.values()))
+    cols = [c for c in mapping if c in df.columns]
+    return df[cols].rename(columns=mapping).reset_index(drop=True)
+
+
+# Cell tints by status/badge. Semi-transparent so the theme's own text color
+# stays readable on top in both Light and Dark mode. The words differ too, so
+# color is never the only signal.
+_TINT_GOOD = "background-color: rgba(7, 148, 100, 0.22)"
+_TINT_BAD = "background-color: rgba(224, 104, 43, 0.24)"
+_TINT_MID = "background-color: rgba(59, 130, 246, 0.18)"
+_TINT_OK = "background-color: rgba(187, 131, 0, 0.20)"
+_TINT_NONE = "background-color: rgba(128, 128, 128, 0.16)"
+
+
+def _tint_for(value):
+    v = str(value or "")
+    if v in ("Met", "Gold Star"):
+        return _TINT_GOOD
+    if v.startswith("Missing") or v == "Needs Improvement":
+        return _TINT_BAD
+    if v == "Silver Star":
+        return _TINT_MID
+    if v == "Bronze Star":
+        return _TINT_OK
+    if v in ("Not required", "Not open in range"):
+        return _TINT_NONE
+    return ""
+
+
+def tint_cells(df, columns, percent_columns=()):
+    """A pandas Styler with status/badge cells tinted and % columns formatted."""
+    styler = df.style
+    apply = getattr(styler, "map", None) or styler.applymap
+    present = [c for c in columns if c in df.columns]
+    if present:
+        styler = apply(_tint_for, subset=present)
+    pct = [c for c in percent_columns if c in df.columns]
+    if pct:
+        styler = styler.format({c: "{:.1f}%" for c in pct}, na_rep="")
+    return styler
+
+
+def percent_bar(label):
+    """A 0-100 progress-bar column labelled like 33.3%."""
+    return st.column_config.ProgressColumn(label, min_value=0, max_value=100, format="%.1f%%")
+
+
+DEFAULT_EXCEL_NAME = "JotForm_Compliance_Report"
+
+# The server runs on UTC; "today" for the date pickers and shortcuts means
+# today in Eastern time, where EPGS operates from.
+LOCAL_TZ = ZoneInfo("America/New_York")
+
+
+def dt_now_local():
+    """Current date and time in Eastern time."""
+    return datetime.datetime.now(LOCAL_TZ)
+
+
+def button_row(key):
+    """A container that lays its buttons out side by side.
+
+    Uses st.container(horizontal=True) (Streamlit 1.46+). On an older build it
+    falls back to a plain container, where the buttons stack instead.
+    """
+    try:
+        return st.container(horizontal=True, gap="small", key=key)
+    except TypeError:
+        return st.container(key=key)
+
+
+def plural(n, word):
+    """'1 location', '2 locations'."""
+    return f"{n:,} {word}" + ("" if n == 1 else "s")
+
+
+def format_date_range(start_date, end_date):
+    """'Nov 17 to Nov 18, 2026', or 'Nov 18, 2026' for a single day."""
+    a, b = pd.to_datetime(start_date), pd.to_datetime(end_date)
+    if a == b:
+        return f"{a:%b} {a.day}, {a.year}"
+    if a.year == b.year:
+        return f"{a:%b} {a.day} to {b:%b} {b.day}, {b.year}"
+    return f"{a:%b} {a.day}, {a.year} to {b:%b} {b.day}, {b.year}"
 
 
 # ===========================================================================
@@ -1526,6 +1802,16 @@ BRAND = {
     "sand":       "#E2E2D2",   # warm neutral
     "border":     "#E2E2E2",   # borders and dividers
     "gray_bg":    "#EFEFEF",   # subtle backgrounds
+    # Deeper teal for anything with white text on it (buttons, tags). White
+    # on the brand teal above reads at about 2.3:1; on this one it's about
+    # 4.9:1, which passes the usual 4.5:1 readability bar. Picked 2026-11-18.
+    # Must match primaryColor in .streamlit/config.toml.
+    "deep":       "#007F78",
+    "deep_hover": "#00665F",
+    "teal_text":  "#007F78",   # teal text and outlines on the page background
+    "tint":       "rgba(0, 127, 120, 0.08)",   # outline-button hover fill
+    "ring":       "rgba(0, 127, 120, 0.40)",   # keyboard focus ring
+    "logo_text":  "#4F4F57",   # the logo's charcoal wordmark
 }
 
 # Dark-mode partners for the BRAND colors that only work on a white page.
@@ -1540,6 +1826,10 @@ BRAND_DARK = {
     "teal_pale":  "#12302E",   # tints and fills (deep teal)
     "border":     "#4A4742",   # borders and dividers
     "gray_bg":    "#2D2B27",   # subtle backgrounds (Streamlit dark sidebar)
+    "teal_text":  "#2CCFC4",   # deep teal is too dark to read on a dark page
+    "tint":       "rgba(0, 192, 181, 0.14)",
+    "ring":       "rgba(44, 207, 196, 0.50)",
+    "logo_text":  "#EDEBE8",   # wordmark turns light so it shows on dark
 }
 
 
@@ -1551,37 +1841,34 @@ def shade(name: str) -> str:
     """
     return f"light-dark({BRAND[name]}, {BRAND_DARK[name]})"
 
-# Commit the logo into an "assets" folder in the repo root, next to main.py.
-# Either the SVG or the PNG works, SVG first. The SVG is preferred because it
-# is vector (sharp on high-DPI screens) and genuinely transparent. The PNG has
-# an alpha channel but no transparent pixels, so its background is solid
-# white: fine on the light theme this app pins in config.toml, but it would
-# show as a white box on a dark background.
+# THE LOGO
+# assets/epgs-vertical.svg is the vertical EPGS logo, converted from the
+# brand PDF (assets/EPGS-VerticalLogo-Color.pdf) on 2026-11-18. It is drawn
+# straight into the page as inline SVG rather than as an <img>, for one
+# reason: Dark mode. Its charcoal wordmark paths carry the class
+# "epgs-logo-text", and the CSS below recolors them with shade("logo_text"),
+# so the words turn light on a dark background. An <img> can't be restyled by
+# the page's CSS. The SVG has no <style> block of its own, so nothing in it
+# can collide with the page's styles.
 #
-# WHY THE IMAGE IS EMBEDDED AS A DATA URI RATHER THAN PASSED TO st.image():
-# st.image() routes bitmaps through PIL, which doesn't read SVG, so support
-# for .svg paths varies by Streamlit version. Base64-encoding the file into an
-# <img> tag sidesteps that entirely and renders crisply at any size on any
-# version. It also keeps the SVG's internal <style> block scoped inside the
-# image, where it can't collide with the page's own CSS classes.
-#
-# If neither file is found the app renders the title alone instead of
-# crashing, so a bad filename degrades quietly rather than taking the
-# dashboard down.
-# Paths are tried in order. ".devcontainer/" is listed because that is where
-# the logo actually lives in this repo right now — the previous version only
-# looked in "assets/", which does not exist, so the header has been silently
-# rendering without a logo. Moving the file to assets/ is the tidier fix; both
-# paths are listed so it works either way.
+# Other paths are tried in order after it (raster fallbacks go through the
+# old data-URI <img> route). If none exists the header shows the title alone
+# instead of crashing.
 LOGO_CANDIDATES = [
-    "assets/EPGS-HorizontalLogo-Color.svg",          # preferred: vector, transparent
-    ".devcontainer/EPGS-HorizontalLogo-Color.svg",   # where it is committed today
-    "EPGS-HorizontalLogo-Color.svg",                 # repo root
-    "assets/EPGS-HorizontalLogo-Color-50.png",       # fallback: raster, white bg
-    ".devcontainer/EPGS-HorizontalLogo-Color-50.png",
+    "assets/epgs-vertical.svg",                      # current: vertical, inline SVG
+    "assets/EPGS-HorizontalLogo-Color.svg",
+    "assets/EPGS-HorizontalLogo-Color-50.png",       # raster, white background
 ]
-LOGO_HEIGHT_PX = 52
+LOGO_HEIGHT_PX = 88
 LOGO_PATH = next((p for p in LOGO_CANDIDATES if os.path.exists(p)), None)
+
+
+@st.cache_data(show_spinner=False)
+def load_inline_svg(path: str) -> str:
+    """An SVG file's markup with class="epgs-logo" on its root element."""
+    with open(path, encoding="utf-8") as fh:
+        svg = fh.read().strip()
+    return svg.replace("<svg ", '<svg class="epgs-logo" ', 1)
 
 _LOGO_MIME = {
     ".svg": "image/svg+xml",
@@ -1603,18 +1890,35 @@ def load_logo_data_uri(path: str) -> str:
 st.markdown(
     f"""
     <style>
-    /* ---- Headings ---- */
+    /* ---- Headings ----
+    Section headings (st.subheader = h3, "####" = h4) are a step smaller than
+    Streamlit's defaults so the dashboard title leads. The .stApp prefix
+    out-ranks Streamlit's own heading rules. */
     h1, h2, h3 {{ color: {shade('slate')}; }}
+    .stApp [data-testid="stMarkdownContainer"] h3 {{ font-size: 1.3rem; }}
+    .stApp [data-testid="stMarkdownContainer"] h4 {{ font-size: 1.1rem; }}
+    .stApp [data-testid="stSidebar"] [data-testid="stMarkdownContainer"] h3 {{
+        font-size: 1.05rem;
+    }}
+    .epgs-label {{ font-size: 0.875rem; margin: 0 0 0.25rem 0; }}
 
     /* ---- App header band ---- */
     .epgs-header {{
         display: flex;
+        flex-wrap: wrap;
         align-items: center;
-        gap: 1rem;
+        gap: 1.25rem;
         padding: 0.4rem 0 0.9rem 0;
         border-bottom: 3px solid {BRAND['teal']};
         margin-bottom: 1.2rem;
     }}
+    .epgs-header .epgs-logo {{
+        height: {LOGO_HEIGHT_PX}px;
+        width: auto;
+        flex: 0 0 auto;
+        display: block;
+    }}
+    .epgs-logo .epgs-logo-text {{ fill: {shade('logo_text')}; }}
     .epgs-header .epgs-title {{
         font-size: 1.6rem;
         font-weight: 700;
@@ -1626,49 +1930,100 @@ st.markdown(
         color: {shade('gray_text')};
     }}
 
-    /* Tabs and multiselect tags take their teal from primaryColor in
-    .streamlit/config.toml, so they need no CSS here. */
+    /* Multiselect tags, checkboxes and the tab underline take their teal from
+    primaryColor in .streamlit/config.toml. The selected tab's LABEL is set
+    here because deep teal text is too dark to read in Dark mode. */
+    [data-testid="stTab"][aria-selected="true"],
+    [data-testid="stTab"][aria-selected="true"] p {{
+        color: {shade('teal_text')};
+    }}
 
     /* ---- Buttons ----
-    Every button (regular, download and form submit, primary or not) gets
-    the same filled teal as Run Report, dark teal on hover and press. */
-    .stButton > button,
-    .stDownloadButton > button,
-    .stFormSubmitButton > button {{
-        background-color: {BRAND['teal']};
-        border-color: {BRAND['teal']};
+    Two styles. SOLID deep teal with white text for the main action in each
+    place (anything with type="primary": Run Report, Download Excel File, the
+    Save alias button). OUTLINE for everything else: no fill, deep teal
+    border and text (a lighter teal in Dark mode so it stays readable).
+    kind^= matches Streamlit's kind attribute, which is "primary" or
+    "secondary" on regular and download buttons and "primaryFormSubmit" or
+    "secondaryFormSubmit" inside forms. */
+    .stButton > button p,
+    .stDownloadButton > button p,
+    .stFormSubmitButton > button p {{
+        font-weight: 600;
+    }}
+    .stButton > button[kind^="primary"],
+    .stDownloadButton > button[kind^="primary"],
+    .stFormSubmitButton > button[kind^="primary"] {{
+        background-color: {BRAND['deep']};
+        border: 1px solid {BRAND['deep']};
         color: #FFFFFF;
     }}
-    .stButton > button:hover,
-    .stButton > button:active,
-    .stDownloadButton > button:hover,
-    .stDownloadButton > button:active,
-    .stFormSubmitButton > button:hover,
-    .stFormSubmitButton > button:active {{
-        background-color: {BRAND['teal_dark']};
-        border-color: {BRAND['teal_dark']};
+    .stButton > button[kind^="primary"]:hover,
+    .stButton > button[kind^="primary"]:active,
+    .stDownloadButton > button[kind^="primary"]:hover,
+    .stDownloadButton > button[kind^="primary"]:active,
+    .stFormSubmitButton > button[kind^="primary"]:hover,
+    .stFormSubmitButton > button[kind^="primary"]:active {{
+        background-color: {BRAND['deep_hover']};
+        border-color: {BRAND['deep_hover']};
         color: #FFFFFF;
+    }}
+    .stButton > button[kind^="secondary"],
+    .stDownloadButton > button[kind^="secondary"],
+    .stFormSubmitButton > button[kind^="secondary"] {{
+        background-color: transparent;
+        border: 1px solid {shade('teal_text')};
+        color: {shade('teal_text')};
+    }}
+    .stButton > button[kind^="secondary"]:hover,
+    .stButton > button[kind^="secondary"]:active,
+    .stDownloadButton > button[kind^="secondary"]:hover,
+    .stDownloadButton > button[kind^="secondary"]:active,
+    .stFormSubmitButton > button[kind^="secondary"]:hover,
+    .stFormSubmitButton > button[kind^="secondary"]:active {{
+        background-color: {shade('tint')};
+        border-color: {shade('teal_text')};
+        color: {shade('teal_text')};
     }}
 
     /* ---- Focus state ----
-    After a click, Streamlit gives a focused button text and border in the
-    theme's primary color (teal, set in .streamlit/config.toml). On a filled
-    teal button that would mean teal text on teal, so this keeps a focused
-    button teal with white text. Keep it even though the theme is teal. */
-    .stButton > button:focus,
-    .stButton > button:focus:not(:active),
-    .stButton > button:focus-visible,
-    .stDownloadButton > button:focus,
-    .stDownloadButton > button:focus:not(:active),
-    .stDownloadButton > button:focus-visible,
-    .stFormSubmitButton > button:focus,
-    .stFormSubmitButton > button:focus:not(:active),
-    .stFormSubmitButton > button:focus-visible {{
-        background-color: {BRAND['teal']} !important;
-        border-color: {BRAND['teal']} !important;
+    After a click Streamlit restyles a focused button in the theme's primary
+    color, which would put teal text on a teal button. These keep each style's
+    own colors and draw a soft teal ring instead. */
+    .stButton > button[kind^="primary"]:focus,
+    .stButton > button[kind^="primary"]:focus-visible,
+    .stDownloadButton > button[kind^="primary"]:focus,
+    .stDownloadButton > button[kind^="primary"]:focus-visible,
+    .stFormSubmitButton > button[kind^="primary"]:focus,
+    .stFormSubmitButton > button[kind^="primary"]:focus-visible {{
+        background-color: {BRAND['deep']} !important;
+        border-color: {BRAND['deep']} !important;
         color: #FFFFFF !important;
-        box-shadow: none !important;
-        outline-color: {BRAND['teal_dark']} !important;
+    }}
+    .stButton > button[kind^="secondary"]:focus,
+    .stButton > button[kind^="secondary"]:focus-visible,
+    .stDownloadButton > button[kind^="secondary"]:focus,
+    .stDownloadButton > button[kind^="secondary"]:focus-visible,
+    .stFormSubmitButton > button[kind^="secondary"]:focus,
+    .stFormSubmitButton > button[kind^="secondary"]:focus-visible {{
+        background-color: transparent !important;
+        border-color: {shade('teal_text')} !important;
+        color: {shade('teal_text')} !important;
+    }}
+    .stButton > button:focus-visible,
+    .stDownloadButton > button:focus-visible,
+    .stFormSubmitButton > button:focus-visible {{
+        box-shadow: 0 0 0 3px {shade('ring')} !important;
+        outline: none !important;
+    }}
+
+    /* ---- KPI card row ----
+    Lets the four summary cards wrap onto a second line when the page is
+    narrow instead of squeezing them until the labels and numbers cut off. */
+    .st-key-kpi_row [data-testid="stHorizontalBlock"] {{ flex-wrap: wrap; }}
+    .st-key-kpi_row [data-testid="stColumn"] {{
+        flex: 1 1 190px !important;
+        min-width: 190px !important;
     }}
 
     /* ---- KPI metric cards ---- */
@@ -1697,21 +2052,20 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
+# st.logo() is deliberately NOT used: it shrinks the image to fit the
+# sidebar's top corner, where a vertical logo's wording becomes unreadable.
 _logo_html = ""
 if LOGO_PATH:
     try:
-        _logo_html = (
-            f'<img src="{load_logo_data_uri(LOGO_PATH)}" '
-            f'alt="Evolution Parking &amp; Guest Services" '
-            f'style="height:{LOGO_HEIGHT_PX}px;">'
-        )
+        if LOGO_PATH.endswith(".svg"):
+            _logo_html = load_inline_svg(LOGO_PATH)
+        else:
+            _logo_html = (
+                f'<img class="epgs-logo" src="{load_logo_data_uri(LOGO_PATH)}" '
+                f'alt="Evolution Parking &amp; Guest Services">'
+            )
     except Exception:
         _logo_html = ""
-    if hasattr(st, "logo"):
-        try:
-            st.logo(LOGO_PATH)
-        except Exception:
-            pass
 
 st.markdown(
     f"""
@@ -1995,23 +2349,53 @@ tab_debug = _tabs[3] if is_admin else None
 with tab_report:
     st.markdown("#### What to pull")
     form_names = list(FORM_NAME_TO_ID.keys())
-    # Full width, own row, with a fixed height. With all 9 forms selected by
-    # default (the common case) and only ~1/3 of the row's width to work
-    # with, the old side-by-side layout below collapsed most of the chips
-    # behind a small overflow icon instead of showing them. `height` lets
-    # Streamlit wrap chips onto multiple visible lines instead of cutting
-    # them off horizontally — bump it further if forms are ever added.
+    # Full width, own row. `wrap` lets the chips flow onto several lines
+    # instead of hiding behind an overflow icon when all forms are selected.
     selected_forms = st.multiselect(
         "Forms", options=form_names, default=form_names, key="selected_forms_widget",
         **MULTISELECT_WRAP_KW,
     )
-    filename = st.text_input("Excel filename (without .xlsx)", "JotForm_Compliance_Report") + ".xlsx"
+
+    # ---- Dates ----
+    # "Today" means today in Eastern time. The server runs on UTC, so a plain
+    # date.today() (what the date pickers used to default to) rolled over to
+    # tomorrow every evening after 7 or 8 pm Eastern.
+    def _today():
+        return dt_now_local().date()
+
+    if "start_date_widget" not in st.session_state:
+        st.session_state["start_date_widget"] = _today()
+    if "end_date_widget" not in st.session_state:
+        st.session_state["end_date_widget"] = _today()
+
+    # Shortcut buttons set both pickers. Callbacks, for the same reason as the
+    # location buttons below: a widget's own key can only be written before
+    # the widget is created on the next run.
+    def _set_dates(kind):
+        t = _today()
+        if kind == "yesterday":
+            s = e = t - datetime.timedelta(days=1)
+        elif kind == "last7":
+            s, e = t - datetime.timedelta(days=6), t
+        elif kind == "month":
+            s, e = t.replace(day=1), t
+        else:
+            s = e = t
+        st.session_state["start_date_widget"] = s
+        st.session_state["end_date_widget"] = e
+
+    st.markdown('<p class="epgs-label">Dates</p>', unsafe_allow_html=True)
+    with button_row("date_shortcuts"):
+        st.button("Today", key="dates_today_btn", on_click=_set_dates, args=("today",))
+        st.button("Yesterday", key="dates_yesterday_btn", on_click=_set_dates, args=("yesterday",))
+        st.button("Last 7 days", key="dates_last7_btn", on_click=_set_dates, args=("last7",))
+        st.button("This month", key="dates_month_btn", on_click=_set_dates, args=("month",))
 
     d1, d2 = st.columns(2)
     with d1:
-        start_date = st.date_input("Start date", **DATE_FMT)
+        start_date = st.date_input("Start date", key="start_date_widget", **DATE_FMT)
     with d2:
-        end_date = st.date_input("End date", **DATE_FMT)
+        end_date = st.date_input("End date", key="end_date_widget", **DATE_FMT)
 
     # A keyed multiselect ignores `default` on every rerun after the first, so
     # if this ever gets cleared it stays cleared. Seed it explicitly once.
@@ -2033,17 +2417,19 @@ with tab_report:
     def _clear_locations():
         st.session_state["selected_locations_widget"] = []
 
-    s1, s2, _ = st.columns([1, 1, 3])
-    with s1:
+    with button_row("location_buttons"):
         st.button("Select all", key="select_all_locs_btn", on_click=_select_all_locations)
-    with s2:
         st.button("Clear", key="clear_locs_btn", on_click=_clear_locations)
 
     if not selected_locations:
         st.caption("No locations selected, so the report covers all of them.")
+    st.caption(
+        f"Shuttle inspections show up on their own when your locations include one "
+        f"of the {len(SHUTTLE_INSPECTION_FORMS)} shuttle sites."
+    )
 
     st.divider()
-    r1, r2 = st.columns([1, 3])
+    r1, r2 = st.columns([1, 3], vertical_alignment="center")
     with r1:
         run_clicked = st.button("Run Report", type="primary", key="run_report_btn")
     with r2:
@@ -2065,7 +2451,7 @@ with tab_report:
             st.error("Select at least one form.")
         else:
             try:
-                with st.spinner(f"Pulling {len(selected_forms)} form(s) from JotForm..."):
+                with st.spinner(f"Pulling {plural(len(selected_forms), 'form')} from JotForm..."):
                     df_all = get_all_data(
                         selected_forms, start_date, end_date, api_key,
                         aliases=st.session_state["location_aliases"],
@@ -2084,6 +2470,23 @@ with tab_report:
                 st.error(str(e))
                 st.session_state.pop("df_all", None)
 
+            # Shuttle inspections are a separate pull, only when the selection
+            # includes a shuttle site. A failure here is shown inside the
+            # shuttle box and never blocks the main report.
+            _shuttle_sites = shuttle_sites_for(selected_locations or locations)
+            st.session_state["shuttle_df"] = None
+            st.session_state["shuttle_error"] = None
+            if _shuttle_sites and "df_all" in st.session_state:
+                st.session_state["report_context"]["shuttle_sites"] = _shuttle_sites
+                try:
+                    with st.spinner(f"Pulling shuttle inspections for "
+                                    f"{plural(len(_shuttle_sites), 'site')}..."):
+                        st.session_state["shuttle_df"] = get_shuttle_data(
+                            _shuttle_sites, start_date, end_date, api_key, force=force_fresh,
+                        )
+                except JotFormError as e:
+                    st.session_state["shuttle_error"] = str(e)
+
     # ---- Results ----
     # Aliases are re-applied on every render rather than trusted from the
     # stashed pull, so saving an alias on the Location Health tab updates the
@@ -2092,55 +2495,30 @@ with tab_report:
     if df_all is not None:
         ctx = st.session_state.get("report_context", {})
         ctx_locations = ctx.get("locations") or []
+        ctx_start = ctx.get("start_date", start_date)
+        ctx_end = ctx.get("end_date", end_date)
+        ctx_forms = ctx.get("forms", selected_forms)
+        operating_days = st.session_state.get("location_operating_days", LOCATION_OPERATING_DAYS)
         df_raw = filter_to_locations(df_all, ctx_locations) if ctx_locations else df_all
 
         compliance_summary = compute_period_targets(
-            df_raw, ctx.get("start_date", start_date), ctx.get("end_date", end_date),
-            ctx.get("forms", selected_forms), ctx_locations,
+            df_raw, ctx_start, ctx_end, ctx_forms, ctx_locations,
             overrides=st.session_state.get("location_overrides", LOCATION_COMPLIANCE_OVERRIDES),
-            operating_days=st.session_state.get("location_operating_days", LOCATION_OPERATING_DAYS),
+            operating_days=operating_days,
             all_known_locations=locations,
         )
         leaderboard = leaderboard_with_badges(compliance_summary)
 
-        dropped = len(df_all) - len(df_raw) if df_raw is not None else 0
         unmatched_count = int((~df_all["location"].isin(locations) & df_all["location"].notna()).sum()) \
             if not df_all.empty else 0
 
-        if df_all.empty:
-            st.warning(
-                "No submissions were returned for this selection. The summary below "
-                "still lists every expected location at 0%."
-            )
+        # ---- Build every table first, so the Download button can sit near the
+        # top of the results. Display names are applied here and the Excel
+        # sheets reuse the same tables, so both read the same.
+        compliance_view = for_display(compliance_summary, COMPLIANCE_DISPLAY)
+        leaderboard_view = for_display(leaderboard, LEADERBOARD_DISPLAY)
 
-        st.divider()
-        m1, m2, m3, m4 = st.columns(4)
-        m1.metric("Submissions pulled", f"{len(df_all):,}")
-        m2.metric("Locations reported",
-                  f"{compliance_summary['location'].nunique() if not compliance_summary.empty else 0}")
-        scored = compliance_summary[compliance_summary["target_total"] > 0] \
-            if not compliance_summary.empty else compliance_summary
-        m3.metric("Requirements met",
-                  f"{(scored['status'] == 'Met').sum() if not scored.empty else 0} / {len(scored)}")
-        m4.metric("Average completion",
-                  f"{scored['percent_complete'].mean():.1f}%" if not scored.empty else "—")
-
-        if unmatched_count:
-            st.warning(
-                f"{unmatched_count:,} submission(s) in this pull have a location that "
-                f"isn't on the master list, so they are not counted anywhere below. "
-                f"The Location Health tab shows which values and can fix them.",
-                icon="⚠️",
-            )
-
-        st.subheader("Compliance Summary")
-        st.dataframe(compliance_summary, **FILL)
-
-        st.subheader("Leaderboard")
-        st.dataframe(leaderboard, **FILL)
-
-        # One detail table per detail form, rendered only when that form is in
-        # the selection and actually returned rows.
+        detail_views = []   # (config, table, caption) for detail forms with rows
         detail_exports = {}
         for _detail_name, _cfg in DETAIL_FORMS.items():
             _details = build_detail_table(df_raw, _detail_name)
@@ -2148,47 +2526,143 @@ with tab_report:
             detail_exports[_cfg["sheet"]] = _display
             if _details.empty:
                 continue
-            st.subheader(_cfg["title"])
-            st.caption(
-                f"{len(_details):,} {_cfg['noun']}(s), "
-                f"{_details['person'].nunique()} distinct {_cfg['person_label']} name(s) "
-                f"across {_details['location'].nunique()} location(s). "
-                "Names are free text on the form, so one person can appear under "
-                "more than one spelling."
+            _caption = (
+                f"{plural(len(_details), _cfg['noun'])} from "
+                f"{plural(_details['person'].nunique(), _cfg['person_label'])} at "
+                f"{plural(_details['location'].nunique(), 'location')}. Names are typed "
+                f"in on the form, so one person can show up under more than one spelling."
             )
-            st.dataframe(_display, **FILL)
+            detail_views.append((_cfg, _display, _caption))
 
-        st.subheader("Raw Data")
         # The detail columns are blank on every other form, so they're
-        # stripped here to keep the general Raw Data sheet clean. to_us_dates()
-        # is applied last, once sorting and filtering are done, so the
-        # underlying ISO values were used for all of that.
-        df_raw_display = to_us_dates(
-            df_raw.drop(columns=[c for c in DETAIL_COLUMNS if c in df_raw.columns])
-        ) if df_raw is not None and not df_raw.empty else df_raw
-        st.dataframe(df_raw_display, **FILL)
+        # stripped from Raw Data. to_us_dates() runs last, after sorting and
+        # filtering, so those used the underlying ISO values.
+        raw_view = for_display(
+            to_us_dates(df_raw) if df_raw is not None and not df_raw.empty else df_raw,
+            RAW_DISPLAY,
+        )
+
+        shuttle_sites = ctx.get("shuttle_sites") or []
+        shuttle_error = st.session_state.get("shuttle_error")
+        shuttle_table = None
+        if shuttle_sites and not shuttle_error and st.session_state.get("shuttle_df") is not None:
+            shuttle_table = build_shuttle_table(
+                st.session_state["shuttle_df"], shuttle_sites, ctx_start, ctx_end, operating_days,
+            )
+        shuttle_view = (shuttle_table.drop(columns=["_missing", "_required", "_covered"])
+                        if shuttle_table is not None and not shuttle_table.empty else None)
 
         if df_raw is not None and not df_raw.empty:
-            submission_count = df_raw.groupby(["form_name", "location"]).size() \
-                .reset_index(name="submission_count")
+            submission_count = (df_raw.groupby(["form_name", "location"]).size()
+                                .reset_index(name="Submissions")
+                                .rename(columns={"form_name": "Form", "location": "Location"}))
         else:
-            submission_count = pd.DataFrame(columns=["form_name", "location", "submission_count"])
+            submission_count = pd.DataFrame(columns=["Form", "Location", "Submissions"])
 
         output = io.BytesIO()
         with pd.ExcelWriter(output, engine="openpyxl") as writer:
-            compliance_summary.to_excel(writer, index=False, sheet_name="Compliance Summary")
-            leaderboard.to_excel(writer, index=False, sheet_name="Leaderboard")
-            if df_raw_display is not None:
-                df_raw_display.to_excel(writer, index=False, sheet_name="Raw Data")
+            compliance_view.to_excel(writer, index=False, sheet_name="Compliance Summary")
+            leaderboard_view.to_excel(writer, index=False, sheet_name="Leaderboard")
+            raw_view.to_excel(writer, index=False, sheet_name="Raw Data")
             for _sheet_name, _table in detail_exports.items():
                 _table.to_excel(writer, index=False, sheet_name=_sheet_name)
+            if shuttle_view is not None:
+                shuttle_view.to_excel(writer, index=False, sheet_name=SHUTTLE_SHEET)
             submission_count.to_excel(writer, index=False, sheet_name="Submission Count")
-        st.download_button(
-            label="Download Excel File",
-            data=output.getvalue(),
-            file_name=filename,
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+
+        # ---- Render ----
+        st.divider()
+        n_locations = len(ctx_locations) if ctx_locations else len(locations)
+        st.markdown(
+            f"**Results** · {format_date_range(ctx_start, ctx_end)} · "
+            f"{plural(n_locations, 'location')} · {plural(len(ctx_forms), 'form')}"
         )
+
+        if df_all.empty:
+            st.warning(
+                "No submissions were returned for this selection. The summary below "
+                "still lists every expected location at 0%."
+            )
+
+        scored = compliance_summary[compliance_summary["target_total"] > 0] \
+            if not compliance_summary.empty else compliance_summary
+        with st.container(key="kpi_row"):
+            m1, m2, m3, m4 = st.columns(4)
+            m1.metric("Submissions pulled, all sites", f"{len(df_all):,}")
+            m2.metric("Locations reported",
+                      f"{compliance_summary['location'].nunique() if not compliance_summary.empty else 0}")
+            m3.metric("Requirements met",
+                      f"{(scored['status'] == 'Met').sum() if not scored.empty else 0} / {len(scored)}")
+            m4.metric("Average completion",
+                      f"{scored['percent_complete'].mean():.1f}%" if not scored.empty else "n/a")
+
+        fn_col, dl_col = st.columns([2, 3], vertical_alignment="bottom")
+        with fn_col:
+            _name = st.text_input("Excel filename", value=DEFAULT_EXCEL_NAME, key="excel_filename")
+        _name = (_name or "").strip() or DEFAULT_EXCEL_NAME
+        if _name.lower().endswith(".xlsx"):
+            _name = _name[:-5]
+        with dl_col:
+            st.download_button(
+                label="Download Excel File",
+                data=output.getvalue(),
+                file_name=f"{_name}.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                type="primary",
+                key="download_excel_btn",
+            )
+
+        if unmatched_count:
+            st.warning(
+                f"{plural(unmatched_count, 'submission')} in this pull "
+                f"{'has' if unmatched_count == 1 else 'have'} a location that "
+                f"isn't on the master list, so they are not counted anywhere below. "
+                f"The Location Health tab shows which values and can fix them.",
+                icon="⚠️",
+            )
+
+        st.subheader("Compliance Summary")
+        st.dataframe(
+            tint_cells(compliance_view, ["Status"], percent_columns=["% Complete"]),
+            column_config={"% Complete": percent_bar("% Complete")},
+            **TABLE,
+        )
+
+        st.subheader("Leaderboard")
+        st.dataframe(
+            tint_cells(leaderboard_view, ["Badge"], percent_columns=["Overall"]),
+            column_config={"Overall": percent_bar("Overall")},
+            **TABLE,
+        )
+
+        for _cfg, _display, _caption in detail_views:
+            st.subheader(_cfg["title"])
+            st.caption(_caption)
+            st.dataframe(_display, **TABLE)
+
+        if shuttle_sites:
+            st.subheader("Shuttle Inspections")
+            if shuttle_error:
+                st.warning(f"Couldn't pull shuttle inspections: {shuttle_error}")
+            elif shuttle_table is None or shuttle_table.empty:
+                st.caption("No shuttle inspection data for this run. Try running the report again.")
+            else:
+                _req = shuttle_table[shuttle_table["_required"] > 0]
+                _met = int((_req["_missing"] == 0).sum())
+                st.caption(
+                    f"One inspection per operating day at each shuttle site. "
+                    f"{_met} of {plural(len(_req), 'site')} inspected every day "
+                    f"({int(_req['_covered'].sum())} of {plural(int(_req['_required'].sum()), 'site-day')} "
+                    f"covered). Last inspection can be before this date range."
+                )
+                st.dataframe(
+                    tint_cells(shuttle_view, ["Status"], percent_columns=["Coverage"]),
+                    column_config={"Coverage": percent_bar("Coverage")},
+                    **TABLE,
+                )
+
+        with st.expander(f"Raw Data ({plural(len(raw_view), 'row')})"):
+            st.dataframe(raw_view, **TABLE)
 
 
 # ---------------------------------------------------------------------------
@@ -2224,7 +2698,7 @@ with tab_health:
                 "name it should map to and save the alias. The suggestion is a "
                 "starting point, not a decision — confirm it before saving."
             )
-            st.dataframe(unmatched, **FILL)
+            st.dataframe(unmatched, **TABLE)
 
             if is_admin and not locations:
                 st.warning(
@@ -2287,7 +2761,7 @@ with tab_health:
             "values and a 'No' in the last column is drifting because its "
             "dropdown is a frozen hand-maintained list."
         )
-        st.dataframe(by_form, **FILL)
+        st.dataframe(by_form, **TABLE)
 
         st.divider()
         st.markdown("##### Locations with no submissions in this range")
@@ -2297,7 +2771,7 @@ with tab_health:
             "at all, so nobody there can submit. Check the form's dropdown "
             "before treating one of these as a compliance failure."
         )
-        st.dataframe(silent, **FILL)
+        st.dataframe(silent, **TABLE)
 
 
 # ---------------------------------------------------------------------------
@@ -2570,7 +3044,7 @@ if tab_settings is not None:
                     "Reusable dropdown": "Yes" if fname in FORMS_ON_REUSABLE_DROPDOWN else "No",
                     "Names pulled": "Yes" if fname in DETAIL_FORMS else "No",
                 })
-            st.dataframe(pd.DataFrame(ref_rows), **FILL)
+            st.dataframe(pd.DataFrame(ref_rows), **TABLE)
 
 
 # ---------------------------------------------------------------------------
@@ -2628,7 +3102,7 @@ if tab_debug is not None:
                                 "count": count,
                                 "in_current_location_list": (loc_val in locations) if loc_val else False,
                             })
-                        st.dataframe(pd.DataFrame(rows), **FILL)
+                        st.dataframe(pd.DataFrame(rows), **TABLE)
 
                         unmatched = {v: int(c) for v, c in counts.items()
                                      if isinstance(v, str) and v and v not in locations}

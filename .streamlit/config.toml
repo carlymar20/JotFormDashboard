@@ -2,8 +2,10 @@
 #
 # primaryColor replaces Streamlit's default red everywhere the app uses its
 # accent color: multiselect tags, the selected tab, checkboxes, the date
-# picker, and the outline on a focused input. It's Evolution teal, the same
-# value as BRAND["teal"] in main.py.
+# picker, and the outline on a focused input. It's the deeper Evolution teal
+# (#007F78), not the brand teal (#00C0B5): white text on the brand teal is
+# hard to read, so anything with white text on it uses this one. Same value
+# as BRAND["deep"] in main.py; keep the two in step.
 #
 # Having both [theme.light] and [theme.dark] sections is what gives viewers
 # the System / Light / Dark choice in the app's settings menu (System follows
@@ -12,10 +14,10 @@
 # (BRAND and BRAND_DARK).
 
 [theme]
-primaryColor = "#00C0B5"
+primaryColor = "#007F78"
 
 [theme.light]
-primaryColor = "#00C0B5"
+primaryColor = "#007F78"
 
 [theme.dark]
-primaryColor = "#00C0B5"
+primaryColor = "#007F78"
