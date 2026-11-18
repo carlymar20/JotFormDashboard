@@ -1811,7 +1811,7 @@ BRAND = {
     "teal_text":  "#007F78",   # teal text and outlines on the page background
     "tint":       "rgba(0, 127, 120, 0.08)",   # outline-button hover fill
     "ring":       "rgba(0, 127, 120, 0.40)",   # keyboard focus ring
-    "logo_text":  "#4F4F57",   # the logo's charcoal wordmark
+    "logo_text":  "#636466",   # the logo's gray wordmark (from the horizontal file)
 }
 
 # Dark-mode partners for the BRAND colors that only work on a white page.
@@ -1842,24 +1842,31 @@ def shade(name: str) -> str:
     return f"light-dark({BRAND[name]}, {BRAND_DARK[name]})"
 
 # THE LOGO
-# assets/epgs-vertical.svg is the vertical EPGS logo, converted from the
-# brand PDF (assets/EPGS-VerticalLogo-Color.pdf) on 2026-11-18. It is drawn
-# straight into the page as inline SVG rather than as an <img>, for one
-# reason: Dark mode. Its charcoal wordmark paths carry the class
+# assets/epgs-horizontal.svg is the horizontal EPGS logo. It was rebuilt on
+# 2026-11-18 from the vector letter and pineapple shapes in
+# assets/epgs-vertical.svg (itself converted from the brand PDF,
+# assets/EPGS-VerticalLogo-Color.pdf), with each shape placed where it sits
+# in the official horizontal file, assets/EPGS-HorizontalLogo-Color.jpg.
+# That JPG has a solid white background and couldn't change color for Dark
+# mode, which is why it isn't used directly.
+#
+# The logo is drawn straight into the page as inline SVG rather than as an
+# <img>, for one reason: Dark mode. Its gray wordmark paths carry the class
 # "epgs-logo-text", and the CSS below recolors them with shade("logo_text"),
 # so the words turn light on a dark background. An <img> can't be restyled by
-# the page's CSS. The SVG has no <style> block of its own, so nothing in it
-# can collide with the page's styles.
+# the page's CSS. The SVGs have no <style> block of their own, so nothing in
+# them can collide with the page's styles.
 #
 # Other paths are tried in order after it (raster fallbacks go through the
 # old data-URI <img> route). If none exists the header shows the title alone
-# instead of crashing.
+# instead of crashing. LOGO_HEIGHT_PX suits the horizontal logo; use about 88
+# if the vertical one is ever moved back to the top of the list.
 LOGO_CANDIDATES = [
-    "assets/epgs-vertical.svg",                      # current: vertical, inline SVG
-    "assets/EPGS-HorizontalLogo-Color.svg",
-    "assets/EPGS-HorizontalLogo-Color-50.png",       # raster, white background
+    "assets/epgs-horizontal.svg",                    # current: horizontal, inline SVG
+    "assets/epgs-vertical.svg",                      # previous: vertical, inline SVG
+    "assets/EPGS-HorizontalLogo-Color.jpg",          # raster, white background
 ]
-LOGO_HEIGHT_PX = 88
+LOGO_HEIGHT_PX = 60
 LOGO_PATH = next((p for p in LOGO_CANDIDATES if os.path.exists(p)), None)
 
 
@@ -2053,7 +2060,7 @@ st.markdown(
 )
 
 # st.logo() is deliberately NOT used: it shrinks the image to fit the
-# sidebar's top corner, where a vertical logo's wording becomes unreadable.
+# sidebar's top corner, where the logo's small wording becomes unreadable.
 _logo_html = ""
 if LOGO_PATH:
     try:
