@@ -1634,17 +1634,11 @@ st.markdown(
         color: #FFFFFF;
     }}
 
-    /* ---- Focus ring override ----
-    Streamlit's built-in default theme color is red (#FF4B4B) and, unless a
-    [theme] section in .streamlit/config.toml overrides primaryColor, that
-    red shows up as the focus/active outline on ANY button — including plain
-    st.button() calls like "Location match check" and "Field names" that
-    never set kind="primary" at all. The rules above only override :hover,
-    not :focus, which is why a button can look fine at rest, flash red right
-    after being clicked, and stay that way until focus moves elsewhere. This
-    pins the focus ring to brand teal instead, for every button kind. If a
-    [theme] primaryColor is later set in config.toml, this block can be
-    removed and the native color will already be on-brand. */
+    /* ---- Focus state ----
+    After a click, Streamlit gives a focused button text and border in the
+    theme's primary color (teal, set in .streamlit/config.toml). On a filled
+    teal button that would mean teal text on teal, so this keeps a focused
+    button teal with white text. Keep it even though the theme is teal. */
     .stButton > button:focus,
     .stButton > button:focus:not(:active),
     .stButton > button:focus-visible,

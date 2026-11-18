@@ -1,0 +1,17 @@
+# Streamlit theme for the JotForm Compliance Dashboard.
+#
+# primaryColor replaces Streamlit's default red (#C53948) everywhere the app
+# uses its accent color: multiselect tags, the selected tab, checkboxes, the
+# date picker, and the outline on a focused input. It's Evolution teal, the
+# same value as BRAND["teal"] in main.py.
+#
+# The [theme.light] section matters: a viewer who picked "Light" in the app's
+# settings menu gets the custom light theme only when this section exists.
+# Without it they'd fall back to Streamlit's stock Light theme and the red.
+# Values in [theme] also carry into Dark mode.
+
+[theme]
+primaryColor = "#00C0B5"
+
+[theme.light]
+primaryColor = "#00C0B5"
