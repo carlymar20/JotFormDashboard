@@ -1528,6 +1528,29 @@ BRAND = {
     "gray_bg":    "#EFEFEF",   # subtle backgrounds
 }
 
+# Dark-mode partners for the BRAND colors that only work on a white page.
+# Viewers can pick System, Light or Dark in the app's settings menu, and
+# shade() below hands the CSS both values so the browser shows the right one
+# for whichever theme is active. Values match Streamlit's own dark theme so
+# the custom pieces blend in. Teal and white need no partner: they read fine
+# on both backgrounds.
+BRAND_DARK = {
+    "slate":      "#EDEBE8",   # headings (Streamlit dark body text)
+    "gray_text":  "#B8B3A8",   # body copy
+    "teal_pale":  "#12302E",   # tints and fills (deep teal)
+    "border":     "#4A4742",   # borders and dividers
+    "gray_bg":    "#2D2B27",   # subtle backgrounds (Streamlit dark sidebar)
+}
+
+
+def shade(name: str) -> str:
+    """CSS color that is BRAND[name] in light mode and BRAND_DARK[name] in dark.
+
+    Uses CSS light-dark(), which follows the color-scheme Streamlit sets on the
+    app for the active theme.
+    """
+    return f"light-dark({BRAND[name]}, {BRAND_DARK[name]})"
+
 # Commit the logo into an "assets" folder in the repo root, next to main.py.
 # Either the SVG or the PNG works, SVG first. The SVG is preferred because it
 # is vector (sharp on high-DPI screens) and genuinely transparent. The PNG has
@@ -1581,7 +1604,7 @@ st.markdown(
     f"""
     <style>
     /* ---- Headings ---- */
-    h1, h2, h3 {{ color: {BRAND['slate']}; }}
+    h1, h2, h3 {{ color: {shade('slate')}; }}
 
     /* ---- App header band ---- */
     .epgs-header {{
@@ -1595,23 +1618,16 @@ st.markdown(
     .epgs-header .epgs-title {{
         font-size: 1.6rem;
         font-weight: 700;
-        color: {BRAND['slate']};
+        color: {shade('slate')};
         line-height: 1.1;
     }}
     .epgs-header .epgs-sub {{
         font-size: 0.85rem;
-        color: {BRAND['gray_text']};
+        color: {shade('gray_text')};
     }}
 
-    /* ---- Tabs ---- */
-    [data-testid="stTabs"] button[role="tab"] {{
-        font-weight: 600;
-        color: {BRAND['gray_text']};
-    }}
-    [data-testid="stTabs"] button[role="tab"][aria-selected="true"] {{
-        color: {BRAND['teal_dark']};
-        border-bottom-color: {BRAND['teal']};
-    }}
+    /* Tabs and multiselect tags take their teal from primaryColor in
+    .streamlit/config.toml, so they need no CSS here. */
 
     /* ---- Buttons ----
     Every button (regular, download and form submit, primary or not) gets
@@ -1657,24 +1673,18 @@ st.markdown(
 
     /* ---- KPI metric cards ---- */
     [data-testid="stMetric"] {{
-        background-color: {BRAND['teal_pale']};
+        background-color: {shade('teal_pale')};
         border-left: 4px solid {BRAND['teal']};
         border-radius: 4px;
         padding: 0.75rem 1rem;
     }}
-    [data-testid="stMetricLabel"] {{ color: {BRAND['gray_text']}; }}
-    [data-testid="stMetricValue"] {{ color: {BRAND['slate']}; }}
-
-    /* ---- Multiselect chips ---- */
-    [data-baseweb="tag"] {{
-        background-color: {BRAND['teal']} !important;
-        color: #FFFFFF !important;
-    }}
+    [data-testid="stMetricLabel"] {{ color: {shade('gray_text')}; }}
+    [data-testid="stMetricValue"] {{ color: {shade('slate')}; }}
 
     /* ---- Sidebar ---- */
     [data-testid="stSidebar"] {{
-        background-color: {BRAND['gray_bg']};
-        border-right: 1px solid {BRAND['border']};
+        background-color: {shade('gray_bg')};
+        border-right: 1px solid {shade('border')};
     }}
 
     /* ---- Spinner + progress ---- */
