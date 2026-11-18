@@ -1869,6 +1869,17 @@ LOGO_CANDIDATES = [
 LOGO_HEIGHT_PX = 60
 LOGO_PATH = next((p for p in LOGO_CANDIDATES if os.path.exists(p)), None)
 
+# In the horizontal logo the wordmark sits below the middle of the shape (the
+# pineapple is taller than the words), so plain centering left "EVOLUTION /
+# PARKING & GUEST SERVICES" about 5px lower than the title and subtitle beside
+# it. The nudge lifts the logo so its wording lines up with the header text.
+# It scales with LOGO_HEIGHT_PX; the vertical logo doesn't need it.
+LOGO_NUDGE_UP_PX = (
+    round(LOGO_HEIGHT_PX * 25 / 286)
+    if LOGO_PATH and "horizontal" in os.path.basename(LOGO_PATH).lower()
+    else 0
+)
+
 
 @st.cache_data(show_spinner=False)
 def load_inline_svg(path: str) -> str:
@@ -1924,6 +1935,7 @@ st.markdown(
         width: auto;
         flex: 0 0 auto;
         display: block;
+        transform: translateY(-{LOGO_NUDGE_UP_PX}px);
     }}
     .epgs-logo .epgs-logo-text {{ fill: {shade('logo_text')}; }}
     .epgs-header .epgs-title {{
@@ -2362,6 +2374,10 @@ with tab_report:
         "Forms", options=form_names, default=form_names, key="selected_forms_widget",
         **MULTISELECT_WRAP_KW,
     )
+    st.caption(
+        f"Shuttle inspections show up on their own when your locations include one "
+        f"of the {len(SHUTTLE_INSPECTION_FORMS)} shuttle sites."
+    )
 
     # ---- Dates ----
     # "Today" means today in Eastern time. The server runs on UTC, so a plain
@@ -2430,23 +2446,17 @@ with tab_report:
 
     if not selected_locations:
         st.caption("No locations selected, so the report covers all of them.")
-    st.caption(
-        f"Shuttle inspections show up on their own when your locations include one "
-        f"of the {len(SHUTTLE_INSPECTION_FORMS)} shuttle sites."
-    )
 
     st.divider()
-    r1, r2 = st.columns([1, 3], vertical_alignment="center")
-    with r1:
-        run_clicked = st.button("Run Report", type="primary", key="run_report_btn")
-    with r2:
-        force_fresh = st.checkbox(
-            "Force fresh pull",
-            key="force_fresh",
-            help=f"A pull is reused for {PULL_CACHE_TTL_SECONDS // 60} minutes, so "
-                 f"re-running the same forms and dates is instant. Tick this to go "
-                 f"back to JotForm anyway, for example right after someone submits.",
-        )
+    # Stacked: Run Report on its own line, the checkbox directly under it.
+    run_clicked = st.button("Run Report", type="primary", key="run_report_btn")
+    force_fresh = st.checkbox(
+        "Force fresh pull",
+        key="force_fresh",
+        help=f"A pull is reused for {PULL_CACHE_TTL_SECONDS // 60} minutes, so "
+             f"re-running the same forms and dates is instant. Tick this to go "
+             f"back to JotForm anyway, for example right after someone submits.",
+    )
 
     # ---- Run ----
     if run_clicked:
